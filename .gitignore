@@ -1,0 +1,43 @@
+# Python cache and generated files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test and coverage cache
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Type checker and linter cache
+.mypy_cache/
+.pyre/
+.ruff_cache/
+
+# Build and packaging artifacts
+build/
+dist/
+wheels/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local environment and IDE files
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local documentation references
+docs/references/
