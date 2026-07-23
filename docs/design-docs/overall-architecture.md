@@ -2,273 +2,251 @@
 
 ## 1. 文档目的
 
-本文定义 MiniAgent 的总体模块、职责边界和模块间交互。它是系统级设计入口，回答“系统由哪些模块组成”和“模块如何协作”，不展开工具内部执行策略、模型供应商协议、Textual UI 布局或具体存储格式。
+本文定义 MiniAgent 的目标模块、职责边界和模块间交互。MiniAgent 是一个本地单 UI Agent Runtime：用户可以保存多个相互隔离的 Session，但一个进程同一时刻只运行一个 Current Session。
 
-MiniAgent 的目标是从零实现一个最小可用 Agent Runtime：用户可以在多个相互隔离的 Session 中持续对话；模型可以直接回答或请求工具；上下文能够延续、动态组装并在接近窗口上限时压缩；运行过程可以恢复、追踪和测试。
-
-领域术语以仓库根目录 `CONTEXT.md` 为准。主循环、工具和模型供应商的局部设计分别见：
+领域术语以仓库根目录 `CONTEXT.md` 为准。局部设计见：
 
 - `docs/design-docs/main-loop.md`
 - `docs/design-docs/tool-registry-and-execution.md`
 - `docs/design-docs/openai-compatible-model-provider.md`
+- `docs/design-docs/context-management.md`
+- `docs/design-docs/persistence-and-observability.md`
+- `docs/design-docs/textual-ui.md`
 
-本文描述目标架构。若局部文档或当前代码与本文冲突，应先显式记录差异并协调设计，不能静默选择其中一个版本。
+本文描述目标架构。若局部文档或当前代码与本文冲突，应显式记录实现差距，不能静默选择其中一个版本。
 
 ## 2. 架构原则
 
-### 2.1 控制与信息流
+### 2.1 一个活动 Session
 
-模块间遵循三种交互方式：
+一个进程最多有一个活动 `SessionEngine` worker。历史 Session 只是本地持久化记录；用户打开另一个 Session 时，系统先验证目标可打开，再停止当前 Session，绝不让旧 Session 转为后台运行。
 
-- 命令向下传递，表达用户或上层模块希望系统执行的动作；
-- 事件向上传递，表达已经被系统接受的事实；
-- 查询读取投影，不借查询修改运行状态。
+切换事务可以短暂同时持有新旧两个 Repository handle，但只有旧 Session 的 worker 能运行。新 worker 必须在旧 worker 停止并释放资源后启动。
 
-SessionEvent 必须先由 SessionEngine 接受并持久化，才能更新内存投影并作为正式状态通知 UI。UI 投递失败不反向破坏已经提交的 AgentRun 状态。
+### 2.2 排队输入不是恢复事实
 
-### 2.2 状态所有权
+`SessionEngine` 接受输入时分配 `message_id` 和 `run_id`，并将其保存为内存 `QueuedInput`。排队输入可以展示和撤回，但不写 Message Journal；切换、关闭或进程崩溃时允许丢失。
 
-每类状态只有一个所有者：Application Coordinator 拥有应用级多 Session 目录；SessionEngine 拥有单个 Session 的事件顺序和消息投影；AgentLoop 拥有一次 AgentRun 的控制状态；ContextManager 拥有一次 ModelCall 的上下文组装过程。
+worker 真正开始处理队首输入时，必须先将用户消息写入并 fsync Message Journal。只有写入成功后，才能建立 AgentRunEnvironment、调用模型或执行工具。持久化失败不得产生模型费用或工具副作用。
 
-上下文压缩只改变模型输入投影，不删除或改写 Transcript。模型、工具、UI 和存储适配器都不能绕过 SessionEngine 直接修改会话历史。
+### 2.3 状态所有权
 
-### 2.3 动态运行环境
+- Textual App 拥有 Current Session 引用、UI Projection 和 Session 生命周期转换；
+- SessionEngine 拥有单个 Session 的内存输入队列、Transcript、唯一 worker 和运行取消；
+- SessionRepository 拥有目录发现、Journal 读写和 writer lock；
+- AgentLoop 拥有一次 AgentRun 的控制状态；
+- ContextManager 拥有 system context 与 Model Context 的组装规则；
+- RuntimeConfig 拥有当前模型与运行默认值。
 
-Agent 的可用模型、工具、权限、上下文预算或其他运行能力可能随时改变，因此 SessionEngine 不长期持有一次解析后的运行能力。AgentLoop 在每次 ModelCall 前通过 RuntimeResolver 获取当时有效的 ModelCall Runtime。
+模型、工具、UI 和存储实现都不能绕过 SessionEngine 修改 Transcript。Textual App 可以编排应用生命周期，但不执行 AgentLoop，也不解释模型或工具协议。
 
-一次已经发出的 ModelCall 使用调用开始时解析出的运行环境。调用期间发生的变化不修改在途请求，但会在后续外部动作和下一次 ModelCall 生效。
+### 2.4 固定运行环境与动态工具
 
-### 2.4 可替换的外部边界
+队首用户消息持久化成功后，SessionEngine 收集已经组装好的固定值，形成不可变 AgentRunEnvironment。system context、model_id、生成选项和运行限制在整个 AgentRun 中保持不变；模型切换只影响尚未开始的排队输入。
 
-Textual UI、模型供应商和持久化实现都是核心 Runtime 之外的适配边界。核心流程不依赖 Textual Widget、OpenAI 原始 JSON、HTTP/SSE 或具体数据库格式。测试可以用内存实现替换这些边界。
+ToolView 是唯一按 ModelCall 动态组装的能力快照。AgentLoop 必须使用同一个 ToolView 构建 prompt、声明 schema 并执行 ToolUse。
+
+### 2.5 可替换的外部边界
+
+Textual、模型供应商、工具实现、SessionRepository 和 TraceSink 都是核心循环之外的适配边界。测试可以用内存实现替换它们。
 
 ## 3. 总体模块
 
 ```mermaid
 flowchart TD
-    UI["Textual UI"]
-    APP["Application Coordinator"]
-    SESSION["SessionEngine"]
+    UI["Textual App"]
+    SESSION["Current SessionEngine"]
+    REPO["SessionRepository"]
+    CONFIG["RuntimeConfig"]
     LOOP["AgentLoop"]
-    RUNTIME["RuntimeResolver"]
     CONTEXT["ContextManager"]
     MODEL["Model Provider"]
-    TOOLS["Tool Registry / Executor"]
-    STORE["Session Repository"]
-    TRACE["Trace Sink"]
+    TOOLS["Tool Capabilities / Executor"]
+    TRACE["TraceSink"]
 
-    UI -->|"命令 / 查询"| APP
-    APP -->|"选择、创建和驱动 Session"| SESSION
-    SESSION -->|"启动 AgentRun"| LOOP
-    LOOP -->|"每次 ModelCall 前解析"| RUNTIME
-    LOOP -->|"请求 Model Context"| CONTEXT
-    CONTEXT -->|"组装后的 Model Context"| LOOP
-    LOOP -->|"发起 ModelCall"| MODEL
-    LOOP -->|"提交 ToolUse"| TOOLS
-    SESSION -->|"持久化 / 恢复"| STORE
-    SESSION -->|"SessionEvent"| APP
-    APP -->|"事件 / 查询结果"| UI
-    LOOP -.->|"诊断"| TRACE
-    CONTEXT -.->|"诊断"| TRACE
-    MODEL -.->|"诊断"| TRACE
-    TOOLS -.->|"诊断"| TRACE
+    UI -->|"list / create / pre-open"| REPO
+    UI -->|"start / submit / stop / snapshot"| SESSION
+    UI -->|"set model"| CONFIG
+    UI -->|"list models"| MODEL
+    SESSION -->|"Journal handle"| REPO
+    SESSION -->|"run"| LOOP
+    SESSION -->|"freeze defaults"| CONFIG
+    SESSION -->|"fixed system context"| CONTEXT
+    SESSION -->|"SessionUpdate"| UI
+    LOOP -->|"build Model Context"| CONTEXT
+    LOOP -->|"ModelCall"| MODEL
+    LOOP -->|"snapshot and execute ToolView"| TOOLS
+    LOOP -.->|"diagnostics"| TRACE
+    CONTEXT -.->|"diagnostics"| TRACE
+    MODEL -.->|"diagnostics"| TRACE
+    TOOLS -.->|"diagnostics"| TRACE
 ```
 
-RuntimeResolver 是应用运行层中的协作边界，不要求成为独立部署单元或大型模块。它的存在是为了确保 AgentLoop 每次发起 ModelCall 时读取最新状态，而不是复用长期缓存的运行能力。
+### 3.1 Textual App
 
-### 3.1 Application Coordinator
+Textual App 是唯一应用入口。它直接组合 SessionRepository、SessionEngine、RuntimeConfig 和 Model Provider，并负责：
 
-Application Coordinator 是应用的顶层控制者，负责管理多个 Session、路由用户命令、回答应用级查询，并将 SessionEvent 转发给 UI。它不执行 Agent 循环，不组装模型上下文，也不解释模型或工具协议。
+- 保持零个或一个 Current Session；
+- 首条消息创建 Session；
+- 按需列出并切换历史 Session；
+- 订阅 SessionUpdate 并维护 UI Projection；
+- 选择全局模型；
+- 有序清空、切换和关闭。
 
-Textual UI 只能通过 Application Coordinator 与 Runtime 交互。切换当前显示的 Session 不会取消其他 Session 的后台运行。
+创建、打开、清空和关闭由一个轻量 `session_transition_lock` 串行化。普通消息提交不占用此锁；生命周期转换开始后 UI 停止接受新输入。
+
+Textual App 不提供统一 `dispatch(ApplicationRequest)`，也不维护自定义可靠 UI Update 队列、事件 cursor、缺口补放或自动全量重同步协议。
 
 ### 3.2 SessionEngine
 
-SessionEngine 是单个 Session 的所有者，也是 Transcript 和消息投影的唯一提交边界。它负责接收用户输入、维护输入队列、确保同一 Session 内 AgentRun 串行执行、启动和结束 AgentRun、分配事件顺序、恢复历史以及处理取消。
+SessionEngine 是 Current Session 的运行边界和 Transcript 的唯一提交者。它负责：
 
-SessionEngine 长期持有会话身份、事件与消息投影、队列和当前运行标识。它不长期持有某次 ModelCall 解析出的 Model Provider、工具视图或 Context 配置。
+- 接受输入、校验并分配 `message_id` 与 `run_id`；
+- 用 FIFO 内存队列保存 QueuedInput；
+- 通过唯一 `serve()` worker 串行执行 AgentRun；
+- 在运行开始前持久化用户消息；
+- 接受完整 AssistantMessage、ToolResult 和 AgentRun 终态；
+- 发布单一 SessionUpdate 流；
+- 取消活动运行、丢弃排队输入并停止 worker。
 
-### 3.3 AgentLoop
+SessionEngine 不维护 Run Segment。后续输入只有在前一个 AgentRun 已终止后才会写入 Journal，因此 Journal 物理顺序天然等于对话因果顺序。
 
-AgentLoop 承载由一条用户输入触发的一次 AgentRun。它是确定性状态机：请求运行环境、请求上下文、调用模型、消费规范化模型输出、在需要时调用工具，并根据模型结果、取消、错误和轮次限制决定继续或终止。
+### 3.3 SessionRepository
 
-模型负责通过结构化输出提出直接回答或工具调用意图；AgentLoop 不自行推测模型意图。一次 AgentRun 可以包含多次 ModelCall，`turn_count` 只统计实际发出的 ModelCall。
+SessionRepository 是本地 Session 存储的唯一入口。它提供按需 `list_sessions()`、新建 Journal 和 `open_session()`。打开成功的 handle 持有该 Session 的独占 writer lock，并在关闭时释放。
 
-### 3.4 RuntimeResolver
+Repository 不维护 `session.json` 或目录缓存。Session 名称由第一条用户消息生成且不可重命名；创建时间、最后用户输入时间和可打开状态都从 Message Journal 派生。列表扫描隔离单个损坏目录，保留不可打开条目而不是静默隐藏。
 
-RuntimeResolver 在每次 ModelCall 前读取最新 Agent 状态，解析该调用所需的 ModelCall Runtime。该运行环境可以包含当前 Model Provider、可见工具集合、上下文窗口和运行限制等能力与约束。
+打开 Session 时完整验证并重放 Journal，不实现历史分页、cursor 或增量恢复协议。
 
-RuntimeResolver 只解析当前状态，不拥有 Session 历史，也不驱动 AgentLoop。其返回值是单次 ModelCall 使用的不可变视图，用完即失效。
+### 3.4 AgentLoop
+
+AgentLoop 承载一条已持久化用户消息触发的一次 AgentRun。它接收固定 AgentRunEnvironment 和只读 Working Context，并在每次 ModelCall 前取得最新 ToolView、构建 Model Context、调用模型、执行工具，最后返回明确 AgentRunResult。
+
+AgentLoop 通过窄接口向 SessionEngine 提交结果：完整 AssistantMessage、ToolResult 和终态。流式 delta 只发布为 SessionUpdate 或 Trace，不进入 Message Journal。
 
 ### 3.5 ContextManager
 
-ContextManager 负责每次 ModelCall 的动态上下文组装。AgentLoop 将当前 Session 的 Working Context 和 ModelCall Runtime 交给 ContextManager；ContextManager 选择有效消息、注入系统信息、处理工具结果、排除无效内容、估算预算并在必要时压缩，最后返回完整的 Model Context。
+ContextManager 在 AgentRun 开始时组装固定 system context，并在每次 ModelCall 前根据 AgentRunEnvironment、Working Context 和 ToolView 动态构建 Model Context。压缩只改变模型输入投影，不删除或改写 Transcript。
 
-ContextManager 不主动调用 AgentLoop。交互必须保持为“AgentLoop 请求，ContextManager 返回”，从而避免循环依赖。
+### 3.6 Model Provider 与 RuntimeConfig
 
-ContextManager 使用三层上下文模型：
+Model Provider 隔离认证、HTTP/SSE、请求转换和供应商错误。RuntimeConfig 独立保存当前 model_id 与运行默认值。Textual App 直接调用 RuntimeConfig 切换模型；活动 AgentRun 使用已经冻结的 model_id，内存排队输入在真正开始时读取新值。
 
-```text
-Transcript          完整、追加式的权威会话事实
-    ↓ 投影
-Working Context     已被 SessionEngine 接受的有效消息
-    ↓ 动态组装
-Model Context       单次 ModelCall 实际发送给模型的输入
-```
-
-思考过程可以作为 Session 记录或 Trace 保留，但默认不重新放入后续 Model Context。用户消息、Assistant 最终文本、ToolUse 和必要的 ToolResult 构成可延续对话的主要内容。
-
-当预计输入达到模型上下文窗口的 80% 时，ContextManager 执行确定性压缩，目标是将输入降至窗口的 50% 以下。压缩覆盖完整的旧交互，并用带消息边界的 ContextSummary 替代；它不能从任意字符位置截断 ToolUse 与 ToolResult 的关系。压缩开始、完成或失败通过 SessionEvent 表达，供 UI 告知用户，但压缩不计入 `turn_count`。
-
-### 3.6 Model Provider
-
-Model Provider 隔离外部模型协议。它接收 Model Context、当次调用可用的工具 Schema 和生成选项，并输出规范化的文本、思考、工具调用增量和终态事件。
-
-Provider 负责认证、请求转换、HTTP/SSE 和供应商错误规范化；AgentLoop 负责 AssistantMessage 的组装和循环控制。Provider 不访问 Session，不执行工具，也不决定 AgentRun 是否继续。
+模型列表不做应用级缓存，用户打开模型选择器时按需查询 Provider。
 
 ### 3.7 Tools
 
-工具模块由 ToolRegistry 和 ToolExecutor 两个逻辑职责构成。Registry 提供工具名称、描述和参数 Schema；Executor 接收 ToolUse 并返回结构化 ToolResult。AgentLoop 只依赖这项输入输出契约，不了解 calculator、search、todo 等具体工具的实现。
+工具模块提供 ToolView，其中同时绑定可见 ToolSpec、schema、权限和执行能力。AgentLoop 不依赖具体工具实现。
 
-本文不规定工具内部的权限模型、并发策略、重试算法或具体工具设计，这些内容由工具模块局部设计负责。
+### 3.8 Persistence、SessionUpdate 与 Trace
 
-### 3.8 Persistence and Observability
+Message Journal 只保存恢复所需的完整记录：用户消息、完整 AssistantMessage、ToolResult、ContextSummary 和 RunTerminated。它不保存排队输入、Assistant started、流式 delta 或通用事件信封。
 
-Session Repository 保存 Session 元数据、追加式 Transcript 和 ContextSummary 检查点，并支持 SessionEngine 恢复投影。Transcript 是恢复的权威来源；ContextSummary 是可重建的派生检查点。
+Journal 的物理行顺序就是事实顺序，不保存 `journal_sequence`。每类记录使用自己的自然身份，不增加通用 `event_id`，持久化失败后不自动猜测并重试追加。
 
-SessionEvent 与 Trace 必须区分。SessionEvent 是可重放的产品事实，用于持久化、恢复和 UI 投影；Trace 是诊断数据，用于记录耗时、重试、内部错误和关联 ID，不参与业务状态恢复。
+SessionUpdate 是当前进程面向 UI 的单一通知流，可以包含排队状态、流式草稿、完整消息和运行状态，但不参与恢复。Trace 是可丢失的诊断数据，也不参与业务恢复。
 
-持久化成功先于内存提交和 UI 正式展示。进程恢复时，不自动重放结果未知或可能有副作用的外部动作；未完成草稿应被作废，并以明确的中断原因结束原 AgentRun。
+## 4. 核心流程
 
-### 3.9 Textual UI
+### 4.1 首条输入
 
-Textual UI 是输入输出适配器。它向 Application Coordinator 发送命令和查询，并消费 SessionEvent。UI 不直接依赖 AgentLoop、ContextManager、Model Provider、工具或 Session Repository，也不拥有权威会话状态。
+应用启动或 `/clear` 后没有 Current Session。首条输入走专用路径：
 
-本文不定义 UI 布局、Widget、快捷键或展示细节。
+1. Textual App 在生命周期锁内构造未启动的 SessionEngine；
+2. `SessionEngine.start(first_text)` 校验输入并分配 message_id、run_id；
+3. Repository 创建目录、writer lock 和 Journal，并持久化用户消息；
+4. 成功后 Textual App 设置 Current Session 并展示消息；
+5. worker 冻结 AgentRunEnvironment 并启动 AgentLoop。
 
-## 4. 核心运行流程
+任一步失败都不设置 Current Session，也不调用模型。
 
-### 4.1 用户输入到最终回答
+### 4.2 后续输入与排队
 
-```mermaid
-sequenceDiagram
-    participant UI as Textual UI
-    participant APP as Application Coordinator
-    participant S as SessionEngine
-    participant L as AgentLoop
-    participant R as RuntimeResolver
-    participant C as ContextManager
-    participant M as Model Provider
-    participant T as Tools
+运行期间 `submit(text)` 保持可用：
 
-    UI->>APP: 发送用户输入
-    APP->>S: 路由到目标 Session
-    S->>S: 提交用户消息并启动 AgentRun
-    S->>L: run(Working Context)
+1. SessionEngine 校验输入并分配 message_id、run_id；
+2. 创建仅存在内存的 QueuedInput；
+3. 发布 `InputQueued`，UI 显示“排队中”；
+4. 用户可以按 message_id 撤回，不能编辑或重排；
+5. worker 出队时先持久化原身份的用户消息；
+6. 持久化成功后发布 `InputCommitted`，冻结运行环境并执行 AgentRun。
 
-    loop 直到回答或明确终止
-        L->>R: resolve(session_id, run_id)
-        R-->>L: ModelCall Runtime
-        L->>C: build(Working Context, Runtime)
-        C-->>L: Model Context
-        L->>M: ModelCall
-        M-->>L: ModelEvent 流
-        L->>S: 提交 Assistant 相关事件
-        alt 模型产生 ToolUse
-            L->>T: 执行 ToolUse
-            T-->>L: ToolResult
-            L->>S: 提交 ToolResult
-        else 模型给出最终回答
-            L->>S: 提交 RunTerminated
-        end
-    end
+排队项使用执行开始时的全局模型，而不是入队时的模型。
 
-    S-->>APP: SessionEvent
-    APP-->>UI: 转发已提交事件
-```
+### 4.3 切换 Session
 
-每次进入循环都会重新解析 ModelCall Runtime 并重新构建 Model Context。AgentLoop 可以在内存中维护本次 AgentRun 已经被 SessionEngine 接受的 Working Context，但不能把未提交的草稿或结果送入下一次 ModelCall。
+用户选择另一个 Session 即授权停止当前运行和丢弃全部排队输入，不再二次确认：
 
-### 4.2 多 Session 与排队
+1. Textual App 获取生命周期锁并禁止新提交；
+2. Repository 预打开目标 Session、获取 writer lock并完整恢复；
+3. 预打开失败时保持当前 Session 原样运行；
+4. 预打开成功后调用当前 `SessionEngine.stop(SESSION_SWITCHED)`；
+5. 取消活动 AgentRun并提交终态，丢弃未持久化队列，释放旧 handle；
+6. 为目标启动唯一 worker，以完整 snapshot 替换 UI Projection。
 
-同一 Session 同一时刻最多有一个活动 AgentRun。运行期间到达的新用户输入进入该 Session 的队列；取消必须由显式命令触发。不同 Session 可以并发运行，互不共享消息、队列和有状态数据。
+`/clear` 与 Session picker 中的 `New session` 复用同一流程，但目标是“无 Current Session”的空白状态，不立即创建目录。
 
-```text
-Session A: AgentRun A1 → queued A2 → AgentRun A2
-Session B: AgentRun B1 ─────────────────────────→
-```
+### 4.4 恢复
 
-### 4.3 上下文自动压缩
+历史列表只在用户打开 Session picker 时扫描。选择目标后 Repository 获取 writer lock，完整验证并重放 Journal。
 
-每次 ModelCall 前，ContextManager 使用 ModelCall Runtime 中的窗口与输出预留计算输入预算：
+若发现已持久化用户消息对应的 AgentRun 没有终态，SessionEngine 不重放模型或工具；它忽略未完成的内存草稿，并追加 `PROCESS_INTERRUPTED`。由于 QueuedInput 从不持久化，恢复时不存在待续跑队列。
 
-```text
-预计输入 < 80%  → 直接返回 Model Context
-预计输入 ≥ 80%  → 提交压缩开始事件
-                 → 确定性压缩至 ≤ 50%
-                 → 保存 ContextSummary
-                 → 提交压缩完成事件
-                 → 返回 Model Context
-```
+### 4.5 关闭
 
-如果压缩失败，原 Transcript 和已提交投影保持不变，当前 AgentRun 产生明确的失败终态。服务端仍返回输入过长时，可以按主循环局部设计执行一次强制压缩重试，但不能无限重试。
-
-### 4.4 恢复流程
-
-Application Coordinator 从 Session Repository 查询可恢复的 Session。SessionEngine 按 Transcript 顺序重建消息和运行投影。若发现上次进程留下未完成 AgentRun，则作废未完成 Assistant 草稿，记录进程中断终态，并等待新的用户输入；系统不能根据旧 ToolUse 猜测并重新执行外部动作。
+Textual App 停止接收输入并调用 `SessionEngine.stop(APPLICATION_SHUTDOWN)`。Engine 丢弃排队输入、协作取消活动运行、提交终态、drain Journal 并释放 writer lock。超时退出的未完成 Run 在下次恢复时记为 `PROCESS_INTERRUPTED`。
 
 ## 5. 错误边界
 
-错误按责任范围传播：
+- 用户消息持久化失败：不进入 Transcript，不启动 AgentRun；
+- Assistant、ToolResult 或终态持久化失败：停止当前运行并要求重新打开 Session 验证 Journal；
+- Provider 和上下文失败：由 AgentLoop 转换为明确 AgentRunResult；
+- 工具的预期失败：形成 ToolResult，模型可以继续；
+- SessionUpdate 投递失败：不回滚 Journal 或改变 AgentRun；
+- Trace 写入失败：不改变业务结果；
+- 目标 Session 损坏或被锁：切换前失败，当前 Session 保持不变。
 
-- 可由模型理解和修正的工具失败形成 ToolResult，AgentLoop 可以继续；
-- Provider 的规范化失败由 AgentLoop 根据类别和限制决定重试或终止；
-- ContextManager 压缩失败终止当前 AgentRun，不修改既有历史；
-- Session Repository 写入失败意味着事件未提交，禁止进入正式投影；
-- UI 投递失败只影响展示，可以通过事件序号补发，不改变 AgentRun；
-- 取消是明确的停止原因，不作为未分类异常处理。
+## 6. 核心不变量
 
-所有 AgentRun 都必须产生明确终态。原始异常和堆栈只进入经过脱敏的 Trace，不直接暴露给模型或 UI。
+1. 一个进程最多有一个活动 SessionEngine worker。
+2. SessionEngine 是 Transcript 的唯一提交边界。
+3. QueuedInput 只存在内存，不属于恢复事实。
+4. 任何模型或工具动作发生前，触发该 AgentRun 的用户消息必须已经 fsync。
+5. 同一 Session 的 AgentRun 严格串行；下一条用户消息只在上一 Run 终止后写入 Journal。
+6. Journal 物理顺序就是 Transcript 的事实顺序。
+7. AgentRunEnvironment 在 AgentRun 内保持不变；每个 ModelCall 使用最新且一致的 ToolView。
+8. 未完成 Assistant 草稿不进入 Journal 或后续 Model Context。
+9. Transcript 不因压缩、UI 行为或切换而删除或改写。
+10. 恢复不得自动重放模型调用或可能有副作用的工具调用。
+11. 同一个 Session 同时只有一个进程持有 writer lock。
+12. SessionUpdate 和 Trace 都不参与业务恢复。
 
-## 6. 测试策略
+## 7. 验证场景
 
-测试以完整运行场景为主，模块规则测试为辅。场景测试使用 Fake Model Provider、内存 Session Repository 和可控工具，从 Application Coordinator 或 SessionEngine 边界驱动系统，并断言 SessionEvent、最终消息和 Session 隔离。
-
-总体架构至少需要以下可观察场景：
-
-1. 模型直接回答并正常结束。
-2. 模型调用工具后根据 ToolResult 返回最终答案。
-3. 达到最大 ModelCall 次数后以明确原因终止。
-4. 纯对话追问和带工具追问都能使用已提交历史。
-5. 两个 Session 可并行运行且状态互不影响。
-6. 输入达到 80% 后产生压缩事件并降至 50% 以下。
-7. Provider、上下文和持久化失败遵守各自错误边界。
-8. 取消和进程中断后能够恢复，不重放未知外部动作。
-9. 每次 ModelCall 都重新调用 RuntimeResolver，并使用最新运行环境组装上下文。
-
-模块级测试重点验证 AgentLoop 状态转换、SessionEngine 事件投影、ContextManager 预算与摘要边界，以及 Model Provider 的规范化契约。Textual UI 不承担核心 Runtime 正确性，只需验证它遵守命令、查询和事件边界。
-
-## 7. 核心不变量
-
-1. SessionEngine 是 SessionEvent 和有效消息历史的唯一提交边界。
-2. 未被 SessionEngine 接受的模型草稿或工具结果不能进入 Working Context。
-3. AgentLoop 每次 ModelCall 前都通过 RuntimeResolver 获取最新 ModelCall Runtime。
-4. ContextManager 每次 ModelCall 都动态组装 Model Context，并将结果返回 AgentLoop。
-5. Transcript 不因上下文压缩、裁剪或 UI 行为而删除或改写。
-6. 达到 80% 窗口水位时触发确定性压缩，正常目标为 50% 以下。
-7. 同一 Session 的 AgentRun 串行执行，不同 Session 可以并行。
-8. Model Provider 和 ToolExecutor 不直接修改 Session 状态。
-9. UI 不直接驱动 AgentLoop，也不拥有权威会话历史。
-10. SessionEvent 用于业务恢复，Trace 不参与业务投影。
+1. 空白启动后首条消息成功创建 Session；创建失败时不调用模型。
+2. 运行期间连续提交消息会获得身份、显示排队态，并按 FIFO 串行执行。
+3. 排队项未出队前不出现在 Journal，撤回、切换和关闭会丢弃它。
+4. 出队用户消息 fsync 成功后才启动 AgentRun。
+5. 模型切换不影响活动 Run，但影响尚未开始的排队输入。
+6. 切换先验证目标；目标损坏或被锁时不取消当前 Run。
+7. 成功切换会取消当前 Run、丢弃队列，并且始终只有一个 worker。
+8. 打开历史 Session 完整恢复；未完成 Run 记为 PROCESS_INTERRUPTED 且不重放工具。
+9. 损坏 Session 在列表中可见但不可打开，不影响其他条目。
+10. UI 更新丢失和 Trace 失败不改变 Journal 或 AgentRunResult。
+11. 两个进程竞争同一 Session 时只有一个获得 writer lock。
 
 ## 8. 当前实现差距
 
-本文是后续实现的目标边界。当前仓库已经具备 SessionEngine、AgentLoop、ContextBuilder、OpenAI-compatible Model Adapter、ToolRegistry、ToolExecutor 和 TranscriptStore 的基础实现，但仍存在以下架构差距：
+当前代码已经具备 SessionEngine、AgentLoop、ContextBuilder、OpenAI-compatible Model Adapter、ToolRegistry、ToolExecutor 和 JsonlTranscriptStore 的基础实现，但尚未达到本文边界：
 
-- AgentLoop 当前在构造时长期接收固定的 ModelAdapter、ContextBuilder、ToolExecutor 和工具集合，尚未在每次 ModelCall 前通过 RuntimeResolver 动态解析运行环境。
-- 当前名称为 ContextBuilder，职责尚未完整覆盖本文定义的 ContextManager 动态组装、80% 触发、50% 目标及压缩生命周期事件。
-- SessionEngine 当前可以追加 Transcript，但 Session 元数据目录、完整加载恢复和 ContextSummary 检查点尚未形成统一 Session Repository。
-- Application Coordinator 和 Textual UI 适配边界尚未实现。
-- 现有局部设计文档中的固定配置或构造期依赖描述，需要在对应模块演进时与本文对齐。
+- AgentLoop 当前仍负责提交用户消息；目标是由 SessionEngine 在 AgentRun 开始前提交。
+- SessionEngine 当前只有简单 asyncio.Queue，没有 `start/serve/stop` 生命周期和排队项撤回语义。
+- 当前所有 SessionEvent 都使用通用 `emit()`、event_id 和 sequence，并持久化 Assistant started/delta/discard；目标 Journal 只保存完整恢复事实。
+- 当前 AssistantMessage 依赖 started/completed 草稿配对；目标是草稿仅存在内存，完成时一次提交。
+- JsonlTranscriptStore 当前没有恢复扫描、fsync、writer lock、目录列表和损坏隔离。
+- Textual App、SessionUpdate、按需历史列表和 Session 切换尚未实现。
+- AgentLoop 尚未接收 AgentRunEnvironment，也未在每次 ModelCall 前获取 ToolView。
+- 当前 ContextBuilder 尚未完整实现 ContextManager 的动态组装与压缩生命周期。
 
-这些差距表示待实现工作，不否定已有模块和测试。后续改动应按可验证的增量逐步收敛到本文定义的边界。
+这些差距表示后续实现工作，不否定已有代码和测试。

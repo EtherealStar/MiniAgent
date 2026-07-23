@@ -48,7 +48,7 @@ MiniAgent 目前没有可注册或执行的工具。完成本计划后，composi
 - Decision：大结果仍按 20 KB 阈值写入 `.mini/sessions/<session_id>/tool_result/<tool_use_id>/`，返回预览和受控引用，但本计划不实现 `read_file`。
   Rationale：保留设计要求的持久化格式和大小边界，同时不越过用户限定的工具范围。当前阶段宿主和测试可检查完整 artifact；模型只能看到预览，此限制必须在最终回顾中保留，直到后续实现 `read_file`。
   Date/Author：2026-07-22 / Codex
-- Decision：工具层不写 `messages.jsonl`，只返回按调用顺序排列的终态结果；结果是否进入 Transcript 和 Working Context 仍由 `SessionEngine` 接受事件后决定。
+- Decision：工具层不写 `message.jsonl`，只返回按调用顺序排列的终态结果；结果是否进入 Transcript 和 Working Context 仍由 `SessionEngine` 接受事件后决定。
   Rationale：这保持 `docs/design-docs/main-loop.md` 规定的唯一会话写入边界，避免 `ToolExecutor` 与主循环竞争历史所有权。
   Date/Author：2026-07-22 / Codex
 - Decision：保留 `miniagent/domain.py` 已有的轻量模型端 `ToolSpec`，完整注册定义使用 `miniagent/tools/models.py` 的 `ToolSpec`；二者通过 `name` 与 `function_schema` 的结构契约兼容，不复制 Registry 或执行逻辑。
@@ -124,7 +124,7 @@ MiniAgent 目前没有可注册或执行的工具。完成本计划后，composi
 
 在 `miniagent/tools/artifacts.py` 实现 `FileArtifactStore`。结果 UTF-8 编码超过工具阈值时，将完整最终内容原子写入 `<workspace>/.mini/sessions/<session_id>/tool_result/<tool_use_id>/result.txt`，metadata 写入同目录 `metadata.json`；临时文件和最终文件必须处于同一目录，写完后用替换操作提交。`grep_spec` 阈值是 20 KB，其他测试 spec 默认 50 KB，且任何工具不能提高系统硬上限。模型可见结果包含截断说明、固定头尾或固定前缀预览、相对 artifact 路径、字节数和 SHA-256；本计划不声称模型能用尚未实现的 `read_file` 读取全文。
 
-trace sink 接收真实发生顺序的 `call_started`、`attempt_started`、`retry_scheduled`、`call_finished` 和错误事件。测试使用内存 sink 验证并发完成顺序，不在执行器内写 `messages.jsonl`。该里程碑结束时，重试次数、屏障时序、取消终态、20 KB 边界、原子 artifact 和按请求顺序返回都必须有行为测试。
+trace sink 接收真实发生顺序的 `call_started`、`attempt_started`、`retry_scheduled`、`call_finished` 和错误事件。测试使用内存 sink 验证并发完成顺序，不在执行器内写 `message.jsonl`。该里程碑结束时，重试次数、屏障时序、取消终态、20 KB 边界、原子 artifact 和按请求顺序返回都必须有行为测试。
 
 ### Milestone 4：实现唯一生产工具 grep
 
