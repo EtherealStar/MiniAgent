@@ -1,0 +1,1 @@
+This fixture contains DEMO_NEEDLE for the no-key demo.

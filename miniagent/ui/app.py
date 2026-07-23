@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -13,7 +14,7 @@ from textual.widgets import Footer
 from ..provider.config import Configured, ProviderConfigLoader
 from ..provider.errors import ProviderNotConfiguredError
 from ..provider.openai import OpenAICompatibleModelAdapter
-from ..context import ContextBuilder
+from ..context import ContextManager, PromptInputs
 from ..tools import build_default_registry
 from ..tools.executor import ToolExecutor
 from ..repository import SessionRepository
@@ -45,13 +46,28 @@ class _ConfiguredLoop:
         registry = build_default_registry()
         model = OpenAICompatibleModelAdapter(self.configuration)
         executor = ToolExecutor(registry.enabled_view(), Path.cwd(), str(committer.session_id))
+        workspace = Path.cwd()
+        agents_path = workspace / "AGENTS.md"
+        try:
+            agents_md = agents_path.read_text(encoding="utf-8") if agents_path.is_file() else ""
+        except OSError:
+            agents_md = ""
+        frozen_now = datetime.now().astimezone()
+        # 工作空间事实只在 AgentRun 开始时读取一次，后续 ModelCall 复用同一快照。
+        prompt_inputs = PromptInputs(
+            identity=system_prompt,
+            workspace_state=str(workspace),
+            agents_md=agents_md,
+            current_time=frozen_now,
+            timezone_name=str(frozen_now.tzinfo or ""),
+        )
         try:
             return await AgentLoop(
                 model,
-                ContextBuilder(),
+                ContextManager(),
                 executor,
                 registry.enabled_view().specs,
-            ).run(initial_messages, user_message, system_prompt, max_turns, committer, cancellation, run_id)
+            ).run(initial_messages, user_message, prompt_inputs, max_turns, committer, cancellation, run_id)
         finally:
             await model.close()
 

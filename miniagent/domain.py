@@ -111,6 +111,10 @@ class ContextSummary:
     summary: str
     summary_id: UUID = field(default_factory=uuid4)
 
+    def __post_init__(self) -> None:
+        if not self.summary.strip():
+            raise ValueError("ContextSummary 正文不能为空")
+
 
 @dataclass(frozen=True, slots=True)
 class ErrorInfo:

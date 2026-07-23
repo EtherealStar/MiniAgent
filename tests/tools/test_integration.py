@@ -3,7 +3,7 @@ from collections import deque
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from miniagent.context import ContextBuilder
+from miniagent.context import ContextManager
 from miniagent.domain import Message, Role
 from miniagent.journal import JournalRecord, JournalRecordType, UserMessagePayload
 from miniagent.loop import AgentLoop
@@ -49,7 +49,7 @@ async def test_default_registry_executes_through_agent_loop(tmp_path):
         ),
     )
     session = SessionEngine(opened)
-    result = await AgentLoop(model, ContextBuilder(), executor, tools=registry.enabled_view().specs).run(
+    result = await AgentLoop(model, ContextManager(), executor, tools=registry.enabled_view().specs).run(
         session.messages, user, "system", 3, session, Cancellation(), run_id
     )
     assert result.turn_count == 2

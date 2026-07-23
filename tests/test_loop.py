@@ -2,12 +2,12 @@ from collections import deque
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from miniagent.context import ContextBuilder
+from miniagent.context import ContextManager, PromptInputs
 from miniagent.domain import Message, Role, StopReason, ToolResult
 from miniagent.journal import JournalRecord, JournalRecordType, UserMessagePayload
 from miniagent.loop import AgentLoop
 from miniagent.ports import Cancellation
-from miniagent.provider.events import ResponseCompleted, ResponseFailed, TextDelta, ToolUseDelta
+from miniagent.provider.events import ResponseCompleted, ResponseFailed, TextDelta, ToolUseDelta, Usage
 from miniagent.repository import SessionRepository
 from miniagent.session import SessionEngine
 
@@ -52,7 +52,7 @@ async def run_loop(tmp_path, model, *, max_turns=4, executor=None, cancellation=
     opened = await SessionRepository(tmp_path, **kwargs).create_session(session_id, first)
     session = SessionEngine(opened)
     signal = cancellation or Cancellation()
-    result = await AgentLoop(model, ContextBuilder(), executor, context_budget=budget).run(
+    result = await AgentLoop(model, ContextManager(), executor, context_budget=budget).run(
         session.messages, user, "system", max_turns, session, signal, run_id
     )
     return result, session
@@ -117,7 +117,7 @@ async def test_missing_terminal_is_reported_in_stream_summary(tmp_path):
     first = JournalRecord(1, JournalRecordType.USER_MESSAGE, session_id, run_id, datetime.now(timezone.utc), UserMessagePayload(user))
     opened = await SessionRepository(tmp_path).create_session(session_id, first)
     session = SessionEngine(opened)
-    await AgentLoop(model, ContextBuilder(), trace_sink=trace).run(
+    await AgentLoop(model, ContextManager(), trace_sink=trace).run(
         session.messages, user, "system", 2, session, Cancellation(), run_id
     )
     summaries = [event for event in trace.events if event.event_type is TraceEventType.STREAM_SUMMARY]
@@ -181,4 +181,105 @@ async def test_assistant_commit_failure_does_not_start_tool(tmp_path):
     result, session = await run_loop(tmp_path, model, executor=executor, sync_file=fail_assistant)
     assert result.reason is StopReason.EVENT_COMMIT_FAILED
     assert executor.batches == []
+    await session.close()
+
+
+async def test_missing_provider_context_window_uses_configured_fallback(tmp_path):
+    model = ScriptedModel([[TextDelta("ok"), ResponseCompleted("stop")]])
+    model.context_window = None
+    result, session = await run_loop(tmp_path, model, budget=1000)
+    assert result.reason is StopReason.COMPLETED
+    assert len(model.contexts) == 1
+    await session.close()
+
+
+async def test_context_compression_is_a_separate_model_call_without_turn_increment(tmp_path):
+    from miniagent.trace import MemoryTraceSink, TraceEventType
+    class Counter:
+        def count_input(self, context, tools, model_name, tokenizer_encoding="o200k_base"):
+            system = context.messages[0].parts[0].content
+            if "compressed history" in system or len(context.messages) == 2:
+                return 20
+            return 75
+
+    session_id, old_run_id, run_id = uuid4(), uuid4(), uuid4()
+    old_user = Message.text(Role.USER, "old request")
+    first = JournalRecord(
+        1,
+        JournalRecordType.USER_MESSAGE,
+        session_id,
+        old_run_id,
+        datetime.now(timezone.utc),
+        UserMessagePayload(old_user),
+    )
+    opened = await SessionRepository(tmp_path).create_session(session_id, first)
+    session = SessionEngine(opened)
+    old_assistant = Message.text(Role.ASSISTANT, "old answer")
+    await session.commit_assistant(old_run_id, old_assistant, "stop")
+    from miniagent.domain import AgentRunResult
+    await session.finish_run(old_run_id, AgentRunResult(StopReason.COMPLETED, 1, old_assistant.message_id))
+    current = Message.text(Role.USER, "current request")
+    await session.commit_user(run_id, current)
+
+    model = ScriptedModel([
+        [TextDelta("compressed history"), ResponseCompleted("stop", Usage(3, 4, 7), "compression-request")],
+        [TextDelta("done"), ResponseCompleted("stop")],
+    ])
+    model.context_window = 100
+    manager = ContextManager(token_counter=Counter())
+    trace = MemoryTraceSink()
+    result = await AgentLoop(model, manager, context_budget=1000, trace_sink=trace).run(
+        session.messages,
+        current,
+        "system",
+        2,
+        session,
+        Cancellation(),
+        run_id,
+    )
+
+    assert result.reason is StopReason.COMPLETED
+    assert result.turn_count == 1
+    assert len(model.contexts) == 2
+    assert len(session.context_summaries) == 1
+    compression_spans = [
+        event for event in trace.events
+        if event.event_type is TraceEventType.SPAN_FINISHED
+        and event.payload.get("operation") == "context_compression"
+    ]
+    assert len(compression_spans) == 1
+    assert compression_spans[0].payload["usage"]["prompt_tokens"] == 3
+    assert compression_spans[0].payload["request_id"] == "compression-request"
+    assistants = [message for message in session.messages if message.role is Role.ASSISTANT]
+    assert assistants == [old_assistant, session.messages[-1]]
+    await session.close()
+
+
+async def test_loop_accepts_complete_frozen_prompt_inputs(tmp_path):
+    model = ScriptedModel([[TextDelta("ok"), ResponseCompleted("stop")]])
+    inputs = PromptInputs(
+        identity="identity",
+        behavior_rules="behavior",
+        risk_constraints="risk",
+        validation_rules="validation",
+        workspace_state="workspace",
+        agents_md="agents",
+        current_time=datetime(2026, 7, 23, tzinfo=timezone.utc),
+        timezone_name="Asia/Shanghai",
+    )
+    session_id, run_id = uuid4(), uuid4()
+    user = Message.text(Role.USER, "go")
+    first = JournalRecord(
+        1, JournalRecordType.USER_MESSAGE, session_id, run_id,
+        datetime.now(timezone.utc), UserMessagePayload(user),
+    )
+    opened = await SessionRepository(tmp_path).create_session(session_id, first)
+    session = SessionEngine(opened)
+
+    await AgentLoop(model, ContextManager()).run(
+        session.messages, user, inputs, 1, session, Cancellation(), run_id
+    )
+
+    system = model.contexts[0].messages[0].parts[0].content
+    assert all(value in system for value in ("identity", "behavior", "risk", "validation", "workspace", "agents"))
     await session.close()

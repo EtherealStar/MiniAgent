@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import AsyncIterator, Protocol
+from typing import AsyncIterator, Mapping, Protocol
 from uuid import UUID
 
 from .domain import AgentRunResult, ContextSummary, Message, ToolExecutionBatch, ToolResult, ToolSpec
@@ -44,6 +44,11 @@ class GenerationOptions:
 @dataclass(frozen=True, slots=True)
 class ModelContext:
     messages: tuple[Message, ...]
+    tool_schemas: tuple[Mapping[str, object], ...] = ()
+    estimated_input_tokens: int = 0
+    estimated_total_tokens: int = 0
+    compression_applied: bool = False
+    diagnostics: tuple[str, ...] = ()
 
 
 class ModelAdapter(Protocol):

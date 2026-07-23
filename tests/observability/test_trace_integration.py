@@ -5,7 +5,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
 
-from miniagent.context import ContextBuilder
+from miniagent.context import ContextManager
 from miniagent.domain import Message, Role
 from miniagent.journal import JournalRecord, JournalRecordType, UserMessagePayload
 from miniagent.loop import AgentLoop
@@ -67,7 +67,7 @@ async def test_run_model_and_tool_spans_share_one_parent_tree_without_content(tm
 
     await AgentLoop(
         model,
-        ContextBuilder(),
+        ContextManager(),
         executor,
         tools=registry.enabled_view().specs,
         trace_sink=trace,

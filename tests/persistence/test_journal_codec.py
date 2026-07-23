@@ -5,6 +5,7 @@ import pytest
 
 from miniagent.domain import (
     AgentRunResult,
+    ContextSummary,
     Message,
     Role,
     StopReason,
@@ -14,6 +15,7 @@ from miniagent.domain import (
 )
 from miniagent.journal import (
     AssistantMessagePayload,
+    ContextSummaryPayload,
     JournalCodec,
     JournalCorruptionError,
     JournalRecord,
@@ -109,5 +111,26 @@ def test_replay_rejects_unknown_tool_result_and_overlapping_runs():
     with pytest.raises(JournalCorruptionError, match="不可交叠"):
         replay_records(
             (record(JournalRecordType.USER_MESSAGE, UserMessagePayload(user)), second),
+            SESSION_ID,
+        )
+
+
+def test_replay_rejects_summary_resuming_from_arbitrary_assistant_message():
+    user = Message.text(Role.USER, "run")
+    first = Message.text(Role.ASSISTANT, "first")
+    second = Message.text(Role.ASSISTANT, "second")
+    summary = ContextSummary(
+        covers_through_message_id=second.message_id,
+        resume_from_message_id=first.message_id,
+        summary="summary",
+    )
+    with pytest.raises(JournalCorruptionError, match="恢复边界无效"):
+        replay_records(
+            (
+                record(JournalRecordType.USER_MESSAGE, UserMessagePayload(user)),
+                record(JournalRecordType.ASSISTANT_MESSAGE, AssistantMessagePayload(first, "length")),
+                record(JournalRecordType.ASSISTANT_MESSAGE, AssistantMessagePayload(second, "stop")),
+                record(JournalRecordType.CONTEXT_SUMMARY, ContextSummaryPayload(summary)),
+            ),
             SESSION_ID,
         )

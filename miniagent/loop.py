@@ -3,9 +3,17 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from uuid import UUID, uuid4
 
-from .context import ContextBuilder, WorkingContext
+from .context import (
+    AgentRunEnvironment,
+    ContextBudgetError,
+    ContextManager,
+    PromptInputs,
+    ToolView,
+    WorkingContext,
+)
 from .hooks import HookDispatcher, HookRegistry
 from .hooks.models import AssistantMessageCompletedContext, PostToolUseContext
 from .domain import (
@@ -42,11 +50,23 @@ class _ToolDraft:
     arguments: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class _BoundContextCommitPort:
+    committer: RunCommitter
+    run_id: UUID
+
+    async def commit_context_summary(self, summary) -> None:
+        await self.committer.commit_context_summary(self.run_id, summary)
+
+    async def publish_live(self, update: object) -> None:
+        await self.committer.publish_live(update)
+
+
 class AgentLoop:
     def __init__(
         self,
         model: ModelAdapter,
-        context_builder: ContextBuilder,
+        context_builder: ContextManager,
         tool_executor: ToolExecutor | None = None,
         tools: tuple[ToolSpec, ...] = (),
         options: GenerationOptions | None = None,
@@ -56,7 +76,7 @@ class AgentLoop:
         dispatcher: HookDispatcher | None = None,
     ) -> None:
         self._model = model
-        self._context_builder = context_builder
+        self._context_manager = context_builder
         self._tool_executor = tool_executor
         self._tools = tools
         self._options = options or GenerationOptions()
@@ -71,7 +91,7 @@ class AgentLoop:
         self,
         initial_messages: tuple[Message, ...],
         user_message: Message,
-        system_prompt: str,
+        system_prompt: str | PromptInputs,
         max_turns: int,
         committer: RunCommitter,
         cancellation: Cancellation,
@@ -89,12 +109,41 @@ class AgentLoop:
         final_message_id: UUID | None = None
         continuation_of: UUID | None = None
         retry_of: UUID | None = None
-        compression_used = False
         recorder = TraceRecorder(self._trace_sink)
         run_context = TraceContext(uuid4(), uuid4(), None, committer.session_id, actual_run_id, user_message.message_id)
         run_span = await recorder.start_span(
             "agent.run", run_context, input_message_id=str(user_message.message_id)
         )
+        if isinstance(system_prompt, PromptInputs):
+            frozen_inputs = system_prompt
+        else:
+            frozen_now = datetime.now().astimezone()
+            frozen_inputs = PromptInputs(
+                identity=system_prompt,
+                current_time=frozen_now,
+                timezone_name=str(frozen_now.tzinfo or ""),
+            )
+        system_context = await self._context_manager.start_run(frozen_inputs)
+        provider_window = getattr(self._model, "context_window", None)
+        context_window = int(
+            self._context_budget if provider_window is None else provider_window
+        )
+        reserved_output = self._options.max_tokens
+        if reserved_output is None:
+            reserved_output = min(4096, max(1, context_window // 5))
+        environment = AgentRunEnvironment(
+            model_name=str(self._model_id or self._provider_name),
+            system_context=system_context,
+            context_window=context_window,
+            reserved_output_tokens=reserved_output,
+            current_user_message_id=user_message.message_id,
+            run_id=actual_run_id,
+            provider=self._model,
+            cancellation=cancellation,
+            trace_recorder=recorder,
+            trace_context=run_context,
+        )
+        context_port = _BoundContextCommitPort(committer, actual_run_id)
 
         async def finish(reason, turns, final_id, error_message=None):
             result = AgentRunResult(
@@ -119,13 +168,29 @@ class AgentLoop:
                 if turn_count >= max_turns:
                     return await finish(StopReason.MAX_TURNS, turn_count, final_message_id)
 
-                current = WorkingContext(messages=tuple(working))
-                context = (
-                    self._context_builder.force_compress(current, system_prompt, self._context_budget)
-                    if compression_used
-                    else self._context_builder.build(current, system_prompt, self._context_budget)
+                current = WorkingContext(
+                    messages=tuple(working),
+                    summaries=tuple(getattr(committer, "context_summaries", ())),
                 )
+                tool_view = ToolView.from_specs(self._tools)
                 message_id = uuid4()
+                try:
+                    context = await self._context_manager.before_model_call(
+                        current,
+                        environment,
+                        tool_view,
+                        context_port,
+                        trigger_model_call_id=message_id,
+                    )
+                except ContextBudgetError as exc:
+                    return await finish(
+                        StopReason.PROMPT_TOO_LONG,
+                        turn_count,
+                        final_message_id,
+                        str(exc),
+                    )
+                except asyncio.CancelledError:
+                    return await finish(StopReason.CANCELLED, turn_count, final_message_id)
                 turn_context = run_context.child(message_id=message_id)
                 context_bytes = self._context_size(context)
                 turn_span = await recorder.start_span(
@@ -136,7 +201,7 @@ class AgentLoop:
                     retry_of_message_id=str(retry_of) if retry_of else None,
                     context_message_count=len(context.messages),
                     context_bytes=context_bytes,
-                    compressed=compression_used,
+                    compressed=context.compression_applied,
                 )
                 model_context = turn_context.child(message_id=message_id)
                 model_span = await recorder.start_span(
@@ -279,14 +344,7 @@ class AgentLoop:
                     await turn_span.finish(TraceStatus.ERROR)
                     await committer.publish_live(AssistantMessageDiscarded(message_id=message_id, reason=terminal.category))
                     if self._is_prompt_too_long(terminal):
-                        if compression_used:
-                            return await finish(StopReason.PROMPT_TOO_LONG, turn_count, final_message_id, terminal.message)
-                        compressed = self._context_builder.force_compress(current, system_prompt, self._context_budget)
-                        if self._context_size(compressed) >= self._context_size(context):
-                            return await finish(StopReason.PROMPT_TOO_LONG, turn_count, final_message_id, "强制压缩未减少输入")
-                        compression_used = True
-                        retry_of = message_id
-                        continue
+                        return await finish(StopReason.PROMPT_TOO_LONG, turn_count, final_message_id, terminal.message)
                     if terminal.category in {"authentication", "client_error"}:
                         return await finish(StopReason.MODEL_UNAVAILABLE, turn_count, final_message_id, terminal.message)
                     retry_of = message_id
@@ -303,6 +361,12 @@ class AgentLoop:
                     },
                     request_id=terminal.request_id,
                 )
+                if terminal.usage is not None:
+                    self._context_manager.record_actual_prompt_tokens(
+                        actual_run_id,
+                        context.estimated_input_tokens,
+                        terminal.usage.prompt_tokens,
+                    )
 
                 parts = []
                 for kind, index in part_order:

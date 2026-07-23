@@ -2,7 +2,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from miniagent.context import ContextBuilder, WorkingContext
+from miniagent.context import WorkingContext
 from miniagent.domain import (
     ContextSummary,
     Message,
@@ -34,22 +34,22 @@ def test_tool_result_must_belong_to_tool_message():
         Message(role=Role.USER, parts=(part,))
 
 
-def test_context_summary_preserves_original_messages():
+def test_working_context_preserves_all_summaries_and_original_messages():
     first = Message.text(Role.USER, "old " * 100)
     second = Message.text(Role.ASSISTANT, "new")
     source = (first, second)
     summary = ContextSummary(first.message_id, second.message_id, "old summary")
-    context = ContextBuilder().build(WorkingContext(source, summary), "system", 100)
     assert source == (first, second)
-    assert context.messages[-1].message_id == second.message_id
-    assert all(message.message_id != first.message_id for message in context.messages)
+    context = WorkingContext(messages=source, summaries=(summary,))
+    assert context.messages == source
+    assert context.summaries == (summary,)
 
 
-def test_tool_result_trimming_only_changes_projection():
+def test_working_context_does_not_mutate_tool_results():
     assistant = Message(role=Role.ASSISTANT, parts=(ToolUsePart("a", "{}", "call"),))
     result = Message(role=Role.TOOL, parts=(ToolResultPart("call", assistant.message_id, "x" * 1000),))
-    context = ContextBuilder().build(WorkingContext((assistant, result)), "", 100)
+    context = WorkingContext(messages=(assistant, result))
     projected = context.messages[-1].parts[0]
     assert isinstance(projected, ToolResultPart)
-    assert len(projected.content) < len(result.parts[0].content)
+    assert projected.content == result.parts[0].content
     assert len(result.parts[0].content) == 1000

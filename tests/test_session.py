@@ -8,7 +8,7 @@ from miniagent.domain import AgentRunResult, ErrorInfo, Message, Role, StopReaso
 from miniagent.journal import JournalRecord, JournalRecordType, UserMessagePayload
 from miniagent.repository import SessionRepository
 from miniagent.session import EventCommitError, SessionEngine
-from miniagent.context import ContextBuilder
+from miniagent.context import ContextManager
 from miniagent.loop import AgentLoop
 from miniagent.provider.events import ResponseCompleted, TextDelta
 
@@ -118,7 +118,7 @@ async def test_queued_inputs_are_not_persisted_until_the_unique_worker_runs_them
     assert [message.parts[0].content for message in engine.messages if message.role is Role.USER] == ["hello"]
 
     model = Model()
-    loop = AgentLoop(model, ContextBuilder())
+    loop = AgentLoop(model, ContextManager())
     await asyncio.gather(
         engine.run_next(loop, "system", 1),
         engine.run_next(loop, "system", 1),

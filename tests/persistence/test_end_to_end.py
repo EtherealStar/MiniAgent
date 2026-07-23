@@ -3,7 +3,7 @@ import asyncio
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from miniagent.context import ContextBuilder
+from miniagent.context import ContextManager
 from miniagent.domain import Message, Role, StopReason, ToolResult
 from miniagent.journal import JournalRecord, JournalRecordType, UserMessagePayload
 from miniagent.loop import AgentLoop
@@ -66,7 +66,7 @@ async def test_two_runs_restore_exact_transcript_without_replaying_side_effects(
         [TextDelta("second done"), ResponseCompleted("stop")],
     ])
     tool = Tool()
-    loop = AgentLoop(model, ContextBuilder(), tool)
+    loop = AgentLoop(model, ContextManager(), tool)
 
     first_result = await loop.run(
         engine.messages, first_user, "system", 3, engine, Cancellation(), first_run
@@ -103,7 +103,7 @@ async def test_trace_failure_does_not_change_run_or_journal_authority(tmp_path):
     engine = SessionEngine(opened)
     result = await AgentLoop(
         Model([[TextDelta("ok"), ResponseCompleted("stop")]]),
-        ContextBuilder(),
+        ContextManager(),
         trace_sink=BrokenTrace(),
     ).run(engine.messages, user, "system", 1, engine, Cancellation(), run_id)
     journal = (tmp_path / str(session_id) / "message.jsonl").read_bytes()
@@ -151,7 +151,7 @@ async def test_trace_queue_overflow_does_not_change_completed_journal(tmp_path):
     trace = JsonlTraceSink(tmp_path / "trace", queue_capacity=1, writer_gate=gate)
     result = await AgentLoop(
         Model([[TextDelta("ok"), ResponseCompleted("stop")]]),
-        ContextBuilder(),
+        ContextManager(),
         trace_sink=trace,
     ).run(engine.messages, user, "system", 1, engine, Cancellation(), run_id)
 

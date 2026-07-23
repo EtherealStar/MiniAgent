@@ -65,3 +65,26 @@ class ToolResultCompleted:
 class RunTerminated:
     reason: str
     turn_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class CompressionStarted:
+    trigger_model_call_id: UUID | None
+    source_boundary_message_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
+class CompressionCompleted:
+    summary_id: UUID
+    covers_through_message_id: UUID
+    resume_from_message_id: UUID | None
+    source_token_count: int
+    summary_token_count: int
+    target_unreachable: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CompressionFailed:
+    reason: str
+    measured_token_count: int
+    protected_token_count: int

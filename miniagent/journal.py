@@ -250,6 +250,7 @@ def replay_records(records: tuple[JournalRecord, ...] | list[JournalRecord], exp
     message_ids: set[UUID] = set()
     assistant_ids: set[UUID] = set()
     assistant_ids_by_run: dict[UUID, set[UUID]] = {}
+    user_message_by_run: dict[UUID, UUID] = {}
     summary_ids: set[UUID] = set()
     tool_uses: dict[str, UUID] = {}
     resolved_tool_uses: set[str] = set()
@@ -271,6 +272,7 @@ def replay_records(records: tuple[JournalRecord, ...] | list[JournalRecord], exp
             _claim_message(payload.message, message_ids)
             active_run = record.run_id
             seen_runs.add(record.run_id)
+            user_message_by_run[record.run_id] = payload.message.message_id
             assistant_ids_by_run[record.run_id] = set()
             messages.append(payload.message)
             continue
@@ -320,6 +322,13 @@ def replay_records(records: tuple[JournalRecord, ...] | list[JournalRecord], exp
                 raise JournalCorruptionError("ContextSummary 边界引用未知消息")
             if boundary <= last_summary_boundary:
                 raise JournalCorruptionError("ContextSummary 覆盖边界倒退")
+            if active_run is None:
+                raise JournalCorruptionError("ContextSummary 必须属于活动 AgentRun")
+            resume = summary.resume_from_message_id
+            expected_next = messages[boundary + 1].message_id if boundary + 1 < len(messages) else None
+            protected_user = user_message_by_run[active_run]
+            if resume not in {expected_next, protected_user}:
+                raise JournalCorruptionError("ContextSummary 恢复边界无效")
             last_summary_boundary = boundary
             summary_ids.add(summary.summary_id)
             summaries.append(summary)
