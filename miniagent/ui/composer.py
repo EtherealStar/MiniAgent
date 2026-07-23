@@ -7,6 +7,11 @@ from textual.binding import Binding
 
 class Composer(TextArea):
     BINDINGS = [Binding("enter", "submit_text", "提交", show=False)]
+
+    def __init__(self, *args, **kwargs) -> None:
+        # 聊天输入不需要代码编辑器的行号槽。
+        kwargs.setdefault("show_line_numbers", False)
+        super().__init__(*args, **kwargs)
     class Submitted(Message):
         def __init__(self, text: str) -> None:
             super().__init__()

@@ -1,6 +1,6 @@
 from uuid import uuid4
 
-from miniagent.domain import Message, ReasoningPart, Role, TextPart
+from miniagent.domain import Message, ReasoningPart, Role, TextPart, ToolResultPart, ToolUsePart
 from miniagent.ui.projection import MessageLifecycle, SessionSnapshot, UiProjection
 from miniagent.updates import (
     AssistantMessageCompleted,
@@ -8,6 +8,7 @@ from miniagent.updates import (
     AssistantPartDelta,
     InputQueued,
     InputWithdrawn,
+    ToolResultCompleted,
     UserMessageCommitted,
 )
 
@@ -65,4 +66,67 @@ def test_snapshot_replaces_all_transient_projection_state():
 
     assert dirty == {restored.message_id}
     assert [item.message_id for item in projection.messages] == [restored.message_id]
+
+
+def _assistant_with_tool_use(tool_use_id: str = "tu-1") -> Message:
+    return Message(
+        role=Role.ASSISTANT,
+        parts=(ToolUsePart("read", '{"path": "a.py"}', tool_use_id),),
+    )
+
+
+def _tool_result_message(tool_use_id: str, assistant_message_id, content: str, *, is_error=False) -> Message:
+    return Message(
+        role=Role.TOOL,
+        parts=(ToolResultPart(tool_use_id, assistant_message_id, content, is_error=is_error),),
+    )
+
+
+def test_tool_result_merges_into_the_calling_tool_part():
+    projection = UiProjection()
+    assistant = _assistant_with_tool_use()
+    projection.apply(AssistantMessageCompleted(assistant, "tool_calls"))
+    tool_part = projection.messages[0].parts[0]
+    assert tool_part.result is None  # 结果到达前处于"等待结果"状态
+
+    projection.apply(ToolResultCompleted(_tool_result_message("tu-1", assistant.message_id, "文件内容")))
+
+    # 结果内联进 assistant 块，不产生独立消息。
+    assert len(projection.messages) == 1
+    merged = projection.messages[0].parts[0]
+    assert merged.result == "文件内容"
+    assert merged.is_error is False
+
+
+def test_tool_result_propagates_is_error():
+    projection = UiProjection()
+    assistant = _assistant_with_tool_use()
+    projection.apply(AssistantMessageCompleted(assistant, "tool_calls"))
+
+    projection.apply(ToolResultCompleted(_tool_result_message("tu-1", assistant.message_id, "爆炸了", is_error=True)))
+
+    merged = projection.messages[0].parts[0]
+    assert merged.result == "爆炸了"
+    assert merged.is_error is True
+
+
+def test_orphan_tool_result_stays_an_independent_message():
+    projection = UiProjection()
+    orphan = _tool_result_message("tu-未知", uuid4(), "无处可去")
+
+    projection.apply(ToolResultCompleted(orphan))
+
+    assert len(projection.messages) == 1
+    assert projection.messages[0].role is Role.TOOL
+    assert projection.messages[0].parts[0].content == "无处可去"
+
+
+def test_snapshot_merges_tool_results_after_replace():
+    assistant = _assistant_with_tool_use()
+    result = _tool_result_message("tu-1", assistant.message_id, "历史结果")
+
+    projection = UiProjection(SessionSnapshot((assistant, result)))
+
+    assert len(projection.messages) == 1
+    assert projection.messages[0].parts[0].result == "历史结果"
 

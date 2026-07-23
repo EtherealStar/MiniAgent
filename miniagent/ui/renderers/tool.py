@@ -28,6 +28,29 @@ def redact_sensitive(value: object, *, key: str = "") -> object:
     return value
 
 
+def summarize_arguments(arguments: str, limit: int = 60) -> str:
+    """工具行的单行参数摘要：取首个参数值，脱敏并压缩空白后截断。"""
+    try:
+        data = json.loads(arguments)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(data, dict) or not data:
+        return ""
+    key = next(iter(data))
+    value = redact_sensitive(data[key], key=key)
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, ensure_ascii=False)
+    text = " ".join(str(value).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def first_line_excerpt(content: str, limit: int = 120) -> str:
+    """失败结果的首行摘要，同样经过脱敏。"""
+    safe = redact_sensitive(content, key="result")
+    first = next((line.strip() for line in str(safe).splitlines() if line.strip()), "")
+    return first if len(first) <= limit else first[: limit - 1] + "…"
+
+
 @dataclass(frozen=True, slots=True)
 class ToolPresentation:
     summary: str
