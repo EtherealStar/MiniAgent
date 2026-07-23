@@ -41,6 +41,20 @@ class ToolFailure:
 
 
 @dataclass(frozen=True, slots=True)
+class PreToolUseOutcome:
+    """AgentLoop 在启动批次前得到的单个 ToolUse 预检决定。"""
+
+    tool_use_id: str
+    rejection_code: str | None = None
+    message: str = ""
+    field_errors: tuple[FieldError, ...] = ()
+
+    @property
+    def accepted(self) -> bool:
+        return self.rejection_code is None
+
+
+@dataclass(frozen=True, slots=True)
 class ArtifactRef:
     path: str
     byte_count: int

@@ -29,7 +29,10 @@ class Tool:
     def __init__(self):
         self.call_count = 0
 
-    async def submit_batch(self, batch, cancellation):
+    def validate_batch(self, batch):
+        pass
+
+    async def submit_batch(self, batch, cancellation, pre_tool_use_outcomes=None):
         self.call_count += 1
         return tuple(
             ToolResult(use.tool_use_id, batch.assistant_message_id, "tool-output")

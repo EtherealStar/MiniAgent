@@ -172,15 +172,17 @@ class ToolOutput(BaseModel):
 ```python
 ToolTarget(
     kind="file",
-    operation="read",
-    value="src/app.py",
+    capability="read",
+    scope="exact",
+    value="D:/study/MiniAgent/src/app.py",
 )
 ```
 
-- resolver 负责 workspace-relative 规范化、越界检查和目标类型确认；
+- resolver 负责从业务 input 声明完整目标、Target Capability（read/write/delete）和 Target Scope（exact/subtree）；路径规范化、Workspace Root 判断与越界 permission 统一交给 Target Authorization；
 - 多资源操作声明全部目标，例如 copy 同时声明 source/read 与 destination/write；
+- move/rename 同时声明 source/delete 与 destination/write；递归访问必须声明 subtree，不能用 exact 授权后再遍历后代；
 - 没有资源目标的纯计算工具显式返回空 targets；
-- handler 通过 `ExecutionContext.targets` 使用已经批准的资源，不从原始路径参数重新建立旁路；
+- handler 通过 `ExecutionContext.targets` 使用已经授权的资源，不从原始路径参数重新建立旁路；
 - handler 不自行实现另一套权限、路径或 guard 规则。
 
 ## 8. Classification 与并发
@@ -232,6 +234,7 @@ async def handler(args: ToolInput, context: ExecutionContext) -> ToolOutput:
 - 第三次连续最终失败后，下一轮不再提供该工具的 schema、索引、静态 Prompt、Recovery 或具名禁用提示；
 - 成功清零对应工具的连续失败；新 AgentRun 使用完整工具集合重新开始；
 - 取消、outcome unknown、unknown tool、未启动调用和内部协议错误不计入阈值。
+- `permission_denied` 表达用户没有授权当前调用，也不计入阈值；工具不得通过参数修正或内部 retry 绕过新的 Permission Decision。
 
 ## 11. Result Policy 与持久化
 
@@ -253,7 +256,7 @@ ResultPolicy 约束完整 ToolOutput 的规范 JSON UTF-8 大小，包括 conten
 3. Provider function schema 包含正确 name、英文 description 和严格 input schema；
 4. 英文 Prompt 使用规定模板，只在工具可见时与 schema 同时出现；
 5. malformed arguments、缺失字段、多余字段和严格类型错误不调用 handler；
-6. resolver 产生正确规范化 targets，目标策略拒绝时不触碰资源；
+6. resolver 产生 capability/scope 完整的 targets；Target Authorization 拒绝时不触碰资源，exact/subtree 与 read/write/delete 不会相互扩大；
 7. handler 只使用批准 targets，classifier 对读写调用给出正确并发特征；
 8. handler 返回错误 output model 时报告内部契约错误；
 9. 成功结果只把 content 投影给模型，metadata/data 结构化持久化；
@@ -265,6 +268,7 @@ ResultPolicy 约束完整 ToolOutput 的规范 JSON UTF-8 大小，包括 conten
 15. 第三次连续最终失败后工具从整个 ToolView 消失，成功清零，新 AgentRun 恢复；
 16. ContextManager 与 ModelAdapter 在同一 ModelCall 中消费同一个刷新后的 ToolView；
 17. 文件系统测试只使用 pytest temporary directories，不依赖真实网络、凭据或用户 Session 数据。
+18. 越界多目标按单个 ToolUse 整体裁决，handler 只收到全部获准的 targets；permission 等待不消耗工具 timeout，拒绝不触发连续失败移除。
 
 开发时先运行聚焦测试。完成代码变更前按仓库约定运行：
 
@@ -279,7 +283,8 @@ uv run python -m pytest -q
 - 目录、工具名、Provider name 和测试是否使用同一个 snake_case 名称？
 - description 与 Prompt 是否为英文，Prompt 是否只描述模型使用决策？
 - input/output schema 是否都从严格 Pydantic model 派生？
-- handler 是否只返回成功 ToolOutput，并通过批准 targets 使用资源？
+- handler 是否只返回成功 ToolOutput，并通过授权 targets 使用资源？
+- 每个目标是否声明了最小 Target Capability 和准确的 exact/subtree 范围，复合操作是否声明全部目标？
 - 并发安全是否有明确无副作用依据？
 - transient retry 是否确认可安全重放？
 - content、metadata 和 data 是否都不泄露敏感信息？

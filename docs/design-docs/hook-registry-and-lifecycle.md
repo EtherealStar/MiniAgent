@@ -13,7 +13,7 @@
 
 ## 2. 设计原则
 
-Hook 只按生命周期时机命名。`PreModelCall`、`PreToolUse` 等名称表达流程位置；压缩判断、权限判断、审计或统计只是注册在这些时机上的扩展实现，不得成为新的 Hook 类型名称。
+Hook 只按生命周期时机命名。`PreModelCall`、`PreToolUse` 等名称表达流程位置；压缩判断、审计或统计只是注册在这些时机上的扩展实现，不得成为新的 Hook 类型名称。文件目标的 Workspace Root 判断和交互式 permission 是 ToolExecutor 的强制 Target Authorization 阶段，不是可选 Hook。
 
 Hook 接收不可变的强类型上下文。Hook 不直接持有或修改 `SessionEngine`、Transcript、Working Context、ToolExecutor 等有状态对象。需要改变正式会话事实时，必须由主流程按既有事件提交边界完成。
 
@@ -99,6 +99,8 @@ ToolUse
 
 快速检查是优化而不是校验真相源。ToolExecutor 仍保留最终的严格校验作为防御性边界；任何路径都不能让未经严格验证的输入进入 handler。合法 `tool_use_id` 对应的预期参数错误必须产生工具设计规定的结构化失败；调用 ID 缺失、重复或消息关联冲突仍属于内部协议错误，不能伪装成 ToolFailure。
 
+PreToolUse 不读取或批准 ToolTarget，不发起 Permission Request，也不持有 AgentRun 拒绝缓存或 Session Permission Grant。快速检查通过后，ToolExecutor 依次完成严格 Pydantic 校验、目标解析和 Target Authorization；漏注册、跳过或更换 Hook 都不能绕过授权。
+
 ### 5.4 PostToolUse
 
 触发时机是 ToolExecutor 返回终态 ToolResult，且该结果已被 SessionEngine 接受之后。Hook 看到的是正式 Journal Record 对应的结果，而不是可能提交失败的临时结果。
@@ -153,9 +155,10 @@ ModelAdapter.stream()
 3. 未被 SessionEngine 接受的消息、摘要或工具结果不能被后续流程当作正式 Working Context 使用。
 4. `PreModelCall` 不取代 ContextManager；上下文压缩仍由 ContextManager 执行。
 5. `PreToolUse` 的快速检查不取代 ToolExecutor 的严格校验。
-6. HookRegistry 冻结后不可修改，空 Registry 保持现有行为。
-7. HookDispatcher 是执行边界，AgentLoop 不直接管理注册列表。
-8. 通知型 Hook 的异常不能回滚已经提交的 Journal Record。
+6. Target Authorization 不是 Hook；Workspace Root 判断和 Permission Decision 不能因 Hook 配置而启用、关闭或改变顺序。
+7. HookRegistry 冻结后不可修改，空 Registry 保持现有行为。
+8. HookDispatcher 是执行边界，AgentLoop 不直接管理注册列表。
+9. 通知型 Hook 的异常不能回滚已经提交的 Journal Record。
 
 ## 9. 当前范围与后续实现边界
 

@@ -7,6 +7,7 @@ from uuid import UUID
 
 from .domain import AgentRunResult, ContextSummary, Message, ToolExecutionBatch, ToolResult, ToolSpec
 from .provider.events import ModelEvent
+from .tools.models import PreToolUseOutcome
 
 
 class Cancellation:
@@ -62,8 +63,13 @@ class ModelAdapter(Protocol):
 
 
 class ToolExecutor(Protocol):
+    def validate_batch(self, batch: ToolExecutionBatch) -> None: ...
+
     async def submit_batch(
-        self, batch: ToolExecutionBatch, cancellation: Cancellation
+        self,
+        batch: ToolExecutionBatch,
+        cancellation: Cancellation,
+        pre_tool_use_outcomes: tuple[PreToolUseOutcome, ...] | None = None,
     ) -> tuple[ToolResult, ...]: ...
 
 

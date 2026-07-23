@@ -9,8 +9,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .models import ExecutionContext, ExecutionTraits, ResultPolicy, ToolSpec
-from .policy import resolve_workspace_target
+from ..models import ExecutionContext, ExecutionTraits, ResultPolicy, ToolSpec
+from ..policy import resolve_workspace_target
 
 
 MAX_LINE_CHARS = 500

@@ -349,3 +349,35 @@ async def test_actual_provider_usage_calibrates_the_next_preflight():
     )
     assert first.estimated_total_tokens == 15
     assert second.estimated_total_tokens == 35
+
+
+async def test_explicit_hook_compression_runs_below_automatic_threshold():
+    class BelowThresholdCounter:
+        def count_input(self, context, tools, model_name, tokenizer_encoding="o200k_base"):
+            return 10
+
+    compressor = RecordingCompressor()
+    manager = ContextManager(
+        token_counter=BelowThresholdCounter(),
+        compressor=compressor,
+    )
+    frozen = await manager.start_run(prompt_inputs())
+    old, current = Message.text(Role.USER, "old"), Message.text(Role.USER, "current")
+    session = CommitPort()
+
+    initial = await manager.before_model_call(
+        WorkingContext(messages=(old, current)),
+        environment(frozen, current),
+        ToolView(),
+        session,
+    )
+    compressed = await manager.request_compression(
+        WorkingContext(messages=(old, current)),
+        environment(frozen, current),
+        ToolView(),
+        session,
+    )
+
+    assert initial.compression_applied is False
+    assert compressed.compression_applied is True
+    assert len(compressor.calls) == len(session.summaries) == 1

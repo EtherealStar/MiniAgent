@@ -61,8 +61,9 @@ SessionEngine 是单个 Session 的 Transcript 所有者和唯一提交边界。
 - `withdraw(message_id)`：撤回尚未出队的 QueuedInput；
 - `serve()`：串行出队、提交用户消息并运行 AgentLoop；
 - `cancel_active()`：协作取消当前 AgentRun；
+- `resolve_permission(request_id, decision)`：裁决当前待定 Permission Request；
 - `stop(reason)`：停止接收输入、取消活动 Run、丢弃队列并关闭 worker；
-- `snapshot()`：返回当前完整消息投影和必要的运行展示状态；
+- `snapshot()`：返回当前完整消息投影、必要的运行展示状态和待定 Permission Request；
 - 发布单一 SessionUpdate 流。
 
 首条输入使用 `start(first_text)`，因为应用此时没有 Current Session。它在返回成功前完成目录创建、writer lock 和首条 UserMessage 持久化；失败时不得留下可用 Session 或启动模型调用。
@@ -93,6 +94,12 @@ session.publish_live(update)
 4. 发布相应 SessionUpdate。
 
 Journal 写入失败时，步骤 3 和 4 不得执行。
+
+### 3.3 Permission 状态
+
+SessionEngine 为当前实例持有一个内存 PermissionManager，其中包含跨 AgentRun 的 Session Permission Grant、当前 AgentRun 的拒绝缓存和至多一个 pending Permission Request。ToolExecutor 通过窄 permission 端口提交已经解析完整的 ToolUse 目标集合；SessionEngine 注册 pending 状态、发布 `PermissionRequested`，并等待 UI 调用 `resolve_permission()`。ToolExecutor 不依赖 Textual，也不直接发布 UI 事件。
+
+Permission Request 是需要响应的粘性 Session 状态，不是 Journal Record。Session grant 跨同一 SessionEngine 的多个 AgentRun 保留；AgentRun 拒绝缓存随 Run 终止清除；切换、清空、退出和重新打开历史 Session 都会创建新的 PermissionManager。普通用户消息即使明确要求外部路径，也不能直接写入授权缓存。
 
 ## 4. AgentLoop
 
@@ -135,16 +142,17 @@ AssistantDelta
 AssistantDiscarded
 AssistantCompleted
 ToolResultCompleted
+PermissionRequested
 RunTerminated
 QueueDiscarded
 SessionStopped
 ```
 
-`InputQueued`、Assistant started/delta/discard 和 QueueDiscarded 只是当前进程状态。它们可以丢失，也不进入 Message Journal。
+`InputQueued`、Assistant started/delta/discard 和 QueueDiscarded 只是当前进程展示状态，可以合并或丢失，也不进入 Message Journal。Permission Request 同样只存在当前进程，但它需要用户响应：SessionEngine 必须在内存中保留 pending 状态、把它包含在 `snapshot()` 中，并确保 `PermissionRequested` 至少投递一次，直到 UI 裁决、Run 取消或 Engine stop 后才清除。
 
 模型响应完整后才提交 AssistantMessage。未完成草稿在取消、流中断或进程崩溃时直接退出有效 UI Projection，不需要 Journal 中的 started/discarded 配对记录。
 
-Textual 可以在需要时用 `snapshot()` 重建当前完整聊天，但 Runtime 不维护 revision、cursor、事件补放或自动缺口恢复协议。
+Textual 可以在需要时用 `snapshot()` 重建当前完整聊天和待定 permission。Runtime 不维护 revision、cursor、历史事件补放或通用自动缺口恢复协议；permission 通过“当前粘性状态 + 至少一次通知”满足交互，不把 SessionUpdate 扩展为可靠事件总线。
 
 ## 7. Working Context 与 ContextManager
 
@@ -198,7 +206,10 @@ worker 取 QueuedInput
                    │       │
                   否       是
                    │       │
-                 完成      执行并提交 ToolResult
+                 完成      目标授权，必要时等待用户
+                              │
+                              ▼
+                            执行并提交 ToolResult
                            │
                            └── 下一次 ModelCall
 ```
@@ -206,6 +217,8 @@ worker 取 QueuedInput
 ### 8.1 工具批次
 
 只有完整 AssistantMessage 成功提交后，其中的 ToolUse 才能执行。若模型产生多个 ToolUse，它们形成一个 ToolExecutionBatch；AgentLoop 等待全部终态结果，再按模型调用顺序提交并继续。
+
+批次中的 Target Authorization 按 ToolUse 原始顺序进行。一个 Permission Request 未裁决前不展示后一个请求，也不启动批次中任何 handler；全部裁决完成后，获准调用才按 ToolExecutor 的安全段规则执行。permission 等待不设超时且不计入工具 timeout。`permission_denied` 是模型可见并持久化的终态 ToolResult，但不计入连续失败移除阈值。
 
 工具失败通常是模型可见 ToolResult，不是 AgentRun 致命错误。最后一个允许的 ModelCall 即使产生工具调用，也要完成并记录工具结果，然后以 `MAX_TURNS` 停止，不再调用模型总结。
 
@@ -225,7 +238,7 @@ worker 取 QueuedInput
 
 ### 9.1 取消
 
-取消信号停止新的 ModelCall，并请求取消当前模型流和工具执行。已经发生的工具副作用不能撤销；无法取消的工具完成后，其真实结果仍应尽力提交。
+取消信号停止新的 ModelCall，并请求取消当前模型流、待定 Permission Request 和工具执行。取消待定 permission 不产生 `permission_denied`；已经发生的工具副作用不能撤销，无法取消的工具完成后，其真实结果仍应尽力提交。
 
 普通取消只影响活动 AgentRun，不自动丢弃后续队列。`stop(reason)` 用于 Session 切换、清空和应用关闭，它会同时丢弃所有未持久化 QueuedInput。
 
@@ -239,6 +252,8 @@ await session.stop(reason=SESSION_SWITCHED | APPLICATION_SHUTDOWN)
 
 Engine 停止接收输入、发布 QueueDiscarded、取消活动 Run、提交明确终态、停止 worker 并关闭 Repository handle。硬超时导致未能提交终态时，交给下次恢复补记 PROCESS_INTERRUPTED。
 
+stop 同时清除 pending Permission Request、当前 AgentRun 拒绝缓存和全部 Session Permission Grant。普通 `cancel_active()` 只清除 pending request 与当前 Run 拒绝缓存，不清除 Session grant。
+
 ### 9.3 进程恢复
 
 恢复只重放 Message Journal。若最后一个已持久化 UserMessage 没有 RunTerminated：
@@ -246,6 +261,7 @@ Engine 停止接收输入、发布 QueueDiscarded、取消活动 Run、提交明
 - 不自动请求模型；
 - 不自动重放 ToolUse；
 - 不恢复任何 QueuedInput；
+- 不恢复 Permission Request、拒绝缓存或 Session Permission Grant；
 - 追加 PROCESS_INTERRUPTED；
 - 允许用户提交新的输入。
 
@@ -262,7 +278,7 @@ result = await agent_loop.run(
 )
 ```
 
-`SessionCommitPort` 只有完整消息、工具结果、运行终态和 live update 的明确方法，不暴露 Repository。
+`SessionCommitPort` 只有完整消息、工具结果、运行终态、live update 和请求 Target Authorization 所需的明确方法，不暴露 Repository 或 UI。PermissionManager 由 SessionEngine 实例持有，不进入 AgentRunEnvironment 或 ToolView。
 
 AgentRunResult 至少包含：
 
@@ -282,7 +298,7 @@ AgentRunResult
 - 工具预期失败转换为 ToolResult；
 - Journal 提交失败转换为 EVENT_COMMIT_FAILED，并使 Session 进入必须停止和重新验证的状态；
 - 未知 ModelEvent、ID 冲突、不可能的消息顺序和重复 worker 是程序错误，直接抛出；
-- SessionUpdate 和 Trace 写入失败不改变 AgentRun 控制流。
+- 展示性 SessionUpdate 和 Trace 写入失败不改变 AgentRun 控制流；`PermissionRequested` 无法至少投递一次时必须保守拒绝该调用，不能执行 handler 或无限等待。
 
 ## 12. 核心不变量
 
@@ -299,6 +315,9 @@ AgentRunResult
 11. stop 会丢弃所有未持久化 QueuedInput。
 12. 恢复不自动重放模型或工具动作。
 13. 只有已经提交的 ToolResult 才能影响后续 Tool Recovery 和工具可用性。
+14. 一个 SessionEngine 至多有一个 pending Permission Request；它存在于 snapshot 中，裁决前相关 handler 不执行。
+15. Session Permission Grant 只存在当前 SessionEngine 内存，恢复、切换、清空和退出都不会保留。
+16. `permission_denied` 是终态 ToolResult，但不计入工具连续失败移除。
 
 ## 13. 建议测试场景
 
@@ -308,6 +327,9 @@ AgentRunResult
 - 出队持久化失败时当前和后续 Run 都不启动；
 - 流式草稿可见但恢复后不存在；
 - 一个 AssistantMessage 含多个 ToolUse，结果乱序完成但顺序提交；
+- 多个越界 ToolUse 按原始顺序请求 permission，全部裁决前没有 handler 启动；deny 只终止当前调用，allow_once 不跨 ToolUse，allow_session 跨本 Session 的 AgentRun；
+- pending permission 出现在 snapshot 中且至少通知一次；Escape 产生 permission_denied，Ctrl+C/stop 取消请求但不伪造拒绝；
+- permission 等待不超时、不增加 turn_count、不消耗工具 timeout；恢复后没有旧请求或授权；
 - 同一批次的同名工具结果按原始 ToolUse 顺序影响下一轮 ToolView，不按完成顺序；
 - 第一次或第二次最终失败只影响紧接的一轮 Recovery，第三次连续失败从下一轮移除工具，成功清零；
 - ContextManager 与 ModelAdapter 接收同一个刷新后的 ToolView，schema 与 Prompt 不漂移；

@@ -14,8 +14,18 @@ from .context import (
     ToolView,
     WorkingContext,
 )
-from .hooks import HookDispatcher, HookRegistry
-from .hooks.models import AssistantMessageCompletedContext, PostToolUseContext
+from .hooks import HookDispatcher, HookExecutionError, HookRegistry
+from .hooks.models import (
+    AbortRun,
+    AssistantMessageCompletedContext,
+    ContinueModelCall,
+    ContinueToolUse,
+    PostToolUseContext,
+    PreModelCallContext,
+    PreToolUseContext,
+    RejectToolUse,
+    RequestCompression,
+)
 from .domain import (
     AgentRunResult,
     ErrorInfo,
@@ -40,6 +50,7 @@ from .provider.errors import ProviderNotConfiguredError
 from .provider.events import ReasoningDelta, ResponseCompleted, ResponseFailed, TextDelta, ToolUseDelta
 from .session import EventCommitError
 from .text_processing import PassthroughTextProcessor
+from .tools.models import FieldError, PreToolUseOutcome
 from .trace import NullTraceSink, TraceContext, TraceEventType, TraceRecorder, TraceStatus, sanitize_error
 
 
@@ -145,12 +156,15 @@ class AgentLoop:
         )
         context_port = _BoundContextCommitPort(committer, actual_run_id)
 
-        async def finish(reason, turns, final_id, error_message=None):
+        async def finish(reason, turns, final_id, error_message=None, error_category=None):
             result = AgentRunResult(
                 reason=reason,
                 turn_count=turns,
                 final_message_id=final_id,
-                error=ErrorInfo(category=reason.value.lower(), message=error_message) if error_message else None,
+                error=ErrorInfo(
+                    category=error_category or reason.value.lower(),
+                    message=error_message,
+                ) if error_message else None,
             )
             await committer.finish_run(actual_run_id, result)
             await run_span.finish(
@@ -168,19 +182,22 @@ class AgentLoop:
                 if turn_count >= max_turns:
                     return await finish(StopReason.MAX_TURNS, turn_count, final_message_id)
 
-                current = WorkingContext(
-                    messages=tuple(working),
-                    summaries=tuple(getattr(committer, "context_summaries", ())),
-                )
+                def current_working() -> WorkingContext:
+                    return WorkingContext(
+                        messages=tuple(working),
+                        summaries=tuple(getattr(committer, "context_summaries", ())),
+                    )
+
+                current = current_working()
                 tool_view = ToolView.from_specs(self._tools)
-                message_id = uuid4()
+                preparation_id = uuid4()
                 try:
                     context = await self._context_manager.before_model_call(
                         current,
                         environment,
                         tool_view,
                         context_port,
-                        trigger_model_call_id=message_id,
+                        trigger_model_call_id=preparation_id,
                     )
                 except ContextBudgetError as exc:
                     return await finish(
@@ -191,6 +208,70 @@ class AgentLoop:
                     )
                 except asyncio.CancelledError:
                     return await finish(StopReason.CANCELLED, turn_count, final_message_id)
+                compression_requested = False
+                while True:
+                    try:
+                        hook_result = await self._dispatcher.before_model_call(
+                            PreModelCallContext(
+                                run_id=actual_run_id,
+                                turn_number=turn_count + 1,
+                                model_context=context,
+                                tool_view_id="|".join(
+                                    definition.name for definition in tool_view.definitions
+                                ),
+                            )
+                        )
+                    except asyncio.CancelledError:
+                        return await finish(StopReason.CANCELLED, turn_count, final_message_id)
+                    except HookExecutionError as exc:
+                        return await finish(
+                            StopReason.HOOK_FAILED,
+                            turn_count,
+                            final_message_id,
+                            str(exc),
+                            "hook_execution",
+                        )
+                    if isinstance(hook_result, ContinueModelCall):
+                        break
+                    if isinstance(hook_result, AbortRun):
+                        return await finish(
+                            StopReason.HOOK_ABORTED,
+                            turn_count,
+                            final_message_id,
+                            hook_result.message,
+                            hook_result.code,
+                        )
+                    if not isinstance(hook_result, RequestCompression):
+                        raise AssertionError("Dispatcher 必须返回强类型 PreModelCall 结果")
+                    if compression_requested:
+                        return await finish(
+                            StopReason.HOOK_FAILED,
+                            turn_count,
+                            final_message_id,
+                            "PreModelCall Hook 重复请求上下文压缩",
+                            "hook_compression_loop",
+                        )
+                    compression_requested = True
+                    try:
+                        context = await self._context_manager.request_compression(
+                            current_working(),
+                            environment,
+                            tool_view,
+                            context_port,
+                            trigger_model_call_id=preparation_id,
+                        )
+                    except asyncio.CancelledError:
+                        return await finish(StopReason.CANCELLED, turn_count, final_message_id)
+                    except ContextBudgetError as exc:
+                        return await finish(
+                            StopReason.HOOK_FAILED,
+                            turn_count,
+                            final_message_id,
+                            str(exc),
+                            "hook_compression_failed",
+                        )
+
+                message_id = uuid4()
                 turn_context = run_context.child(message_id=message_id)
                 context_bytes = self._context_size(context)
                 turn_span = await recorder.start_span(
@@ -393,13 +474,13 @@ class AgentLoop:
                 for tool in (part for part in parts if isinstance(part, ToolUsePart)):
                     await committer.publish_live(ToolUseDetected(message_id=message_id, tool_use_id=tool.tool_use_id, name=tool.name, arguments=tool.arguments))
                 await committer.commit_assistant(actual_run_id, assistant, terminal.finish_reason)
+                final_message_id = message_id
                 await self._dispatcher.assistant_message_completed(
                     AssistantMessageCompletedContext(
                         run_id=actual_run_id, message=assistant, finish_reason=terminal.finish_reason
                     )
                 )
                 working.append(assistant)
-                final_message_id = message_id
                 tool_uses = tuple(part for part in parts if isinstance(part, ToolUsePart))
 
                 if tool_uses:
@@ -412,11 +493,59 @@ class AgentLoop:
                         trace_id=run_context.trace_id,
                         parent_span_id=turn_context.span_id,
                     )
+                    self._tool_executor.validate_batch(batch)
+                    pre_tool_use_outcomes: list[PreToolUseOutcome] = []
                     try:
-                        results = await self._tool_executor.submit_batch(batch, cancellation)
+                        for tool_use in tool_uses:
+                            registered = next(
+                                (spec for spec in self._tools if spec.name == tool_use.name),
+                                None,
+                            )
+                            hook_spec = None if registered is None else ToolSpec(
+                                name=registered.name,
+                                function_schema=registered.function_schema or {},
+                            )
+                            hook_result = await self._dispatcher.before_tool_use(
+                                PreToolUseContext(
+                                    run_id=actual_run_id,
+                                    assistant_message_id=message_id,
+                                    tool_use=tool_use,
+                                    tool_spec=hook_spec,
+                                )
+                            )
+                            if isinstance(hook_result, ContinueToolUse):
+                                pre_tool_use_outcomes.append(
+                                    PreToolUseOutcome(tool_use.tool_use_id)
+                                )
+                            elif isinstance(hook_result, RejectToolUse):
+                                pre_tool_use_outcomes.append(PreToolUseOutcome(
+                                    tool_use_id=tool_use.tool_use_id,
+                                    rejection_code=hook_result.code,
+                                    message=hook_result.message,
+                                    field_errors=tuple(
+                                        FieldError(path, message)
+                                        for path, message in hook_result.field_errors
+                                    ),
+                                ))
+                            else:
+                                raise AssertionError("Dispatcher 必须返回强类型 PreToolUse 结果")
+                        results = await self._tool_executor.submit_batch(
+                            batch,
+                            cancellation,
+                            tuple(pre_tool_use_outcomes),
+                        )
                     except asyncio.CancelledError:
                         await turn_span.finish(TraceStatus.CANCELLED)
                         return await finish(StopReason.CANCELLED, turn_count, final_message_id)
+                    except HookExecutionError as exc:
+                        await turn_span.finish(TraceStatus.ERROR, error_category="hook_execution")
+                        return await finish(
+                            StopReason.HOOK_FAILED,
+                            turn_count,
+                            final_message_id,
+                            str(exc),
+                            "hook_execution",
+                        )
                     ordered = self._order_results(tool_uses, results, message_id)
                     for result in ordered:
                         tool_message = Message(
@@ -459,6 +588,8 @@ class AgentLoop:
                     retry_of = None
                     continue
                 return await finish(StopReason.COMPLETED, turn_count, final_message_id)
+        except asyncio.CancelledError:
+            return await finish(StopReason.CANCELLED, turn_count, final_message_id)
         except EventCommitError as exc:
             await run_span.finish(TraceStatus.ERROR, error_category="event_commit")
             return AgentRunResult(

@@ -25,7 +25,7 @@ SessionEngine 已接受并分配消息与运行身份、但尚未开始 AgentRun
 _Avoid_: UserMessage、已提交消息、持久化队列
 
 **Session Update（会话更新）**:
-SessionEngine 面向当前进程发布的展示通知，既可表达排队状态和流式草稿，也可表达已提交消息和运行终态；它不参与恢复。
+SessionEngine 面向当前进程发布的通知，既可表达排队状态和流式草稿，也可表达已提交消息、运行终态和待处理 Permission Request；它不参与恢复。
 _Avoid_: Journal Record、Trace Record、UI Update
 
 **UI Projection（UI 投影）**:
@@ -173,7 +173,7 @@ _Avoid_: 全局可变工具表、ToolExecutor
 _Avoid_: ToolUse、工具实例
 
 **ToolExecutor（工具执行器）**:
-负责调用前快筛、Pydantic 校验、目标解析、执行重试、取消、结果封装和批次调度的执行边界。
+负责调用前快筛、Pydantic 校验、目标解析与授权、执行重试、取消、结果封装和批次调度的执行边界。
 _Avoid_: ToolRegistry、AgentLoop
 
 **ToolInput（工具输入）**:

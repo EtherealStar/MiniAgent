@@ -7,6 +7,7 @@ __all__ = [
     "HookDispatcher", "HookExecutionError", "HookRegistry", "HookRegistryError", "HookRegistryView",
     "PreModelCallContext", "AssistantMessageCompletedContext", "PreToolUseContext", "PostToolUseContext",
     "PreModelCallHook", "AssistantMessageCompletedHook", "PreToolUseHook", "PostToolUseHook",
-    "ContinueModelCall", "RequestCompression", "AbortRun", "ContinueToolUse", "RejectToolUse",
+    "PreModelCallResult", "PreToolUseResult", "ContinueModelCall", "RequestCompression", "AbortRun",
+    "ContinueToolUse", "RejectToolUse",
     "FastToolValidationHook",
 ]

@@ -105,3 +105,31 @@ async def test_cancelled_error_is_not_wrapped():
 
     with pytest.raises(asyncio.CancelledError):
         await dispatcher.before_tool_use(object())
+
+
+@pytest.mark.asyncio
+async def test_notification_trace_failure_does_not_change_committed_flow():
+    calls = []
+
+    async def broken(context):
+        calls.append("broken")
+        raise ValueError("notification failed")
+
+    async def later(context):
+        calls.append("later")
+
+    class BrokenTrace:
+        async def emit(self, event):
+            raise OSError("trace unavailable")
+
+    registry = HookRegistry()
+    registry.register_assistant_message_completed(broken)
+    registry.register_assistant_message_completed(later)
+    dispatcher = HookDispatcher(registry.freeze(), BrokenTrace())
+    context = AssistantMessageCompletedContext(
+        uuid4(), Message.text(Role.ASSISTANT, "accepted"), "stop"
+    )
+
+    await dispatcher.assistant_message_completed(context)
+
+    assert calls == ["broken", "later"]

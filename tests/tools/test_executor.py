@@ -11,7 +11,16 @@ from miniagent.domain import ToolExecutionBatch, ToolUsePart
 from miniagent.ports import Cancellation
 from miniagent.tools.artifacts import MemoryTraceSink
 from miniagent.tools.executor import ToolExecutor
-from miniagent.tools.models import ExecutionTraits, ResultPolicy, RetryPolicy, ToolExecutionError, ToolProtocolError, ToolSpec
+from miniagent.tools.models import (
+    ExecutionTraits,
+    FieldError,
+    PreToolUseOutcome,
+    ResultPolicy,
+    RetryPolicy,
+    ToolExecutionError,
+    ToolProtocolError,
+    ToolSpec,
+)
 from miniagent.tools.registry import ToolRegistry
 from miniagent.trace import TraceEventType
 
@@ -62,6 +71,76 @@ async def test_validation_failures_do_not_run_handler_and_one_correction_succeed
     second = call("tool", "second", correction_of_tool_use_id="bad")
     rejected = (await subject.submit_batch(batch(second), Cancellation()))[0]
     assert rejected.failure.code == "correction_not_allowed" and runs == 1
+
+
+async def test_pre_tool_rejection_is_enveloped_by_executor_without_handler(tmp_path):
+    runs = 0
+
+    async def handler(args, ctx):
+        nonlocal runs
+        runs += 1
+        return "unexpected"
+
+    subject = executor(tmp_path, [make_spec("tool", handler)])
+    use = call("tool", "blocked")
+    outcomes = (PreToolUseOutcome(
+        "blocked",
+        "invalid_arguments",
+        "blocked by preflight",
+        (FieldError("value", "invalid"),),
+    ),)
+
+    result = (await subject.submit_batch(batch(use), Cancellation(), outcomes))[0]
+
+    assert result.failure.stage == "fast_validation"
+    assert result.failure.field_errors[0].path == "value"
+    assert result.attempts == 0 and runs == 0
+
+
+async def test_pre_tool_outcomes_must_align_before_executor_state_changes(tmp_path):
+    async def handler(args, ctx):
+        return "ok"
+
+    subject = executor(tmp_path, [make_spec("tool", handler)])
+    use = call("tool", "call")
+    with pytest.raises(ToolProtocolError, match="outcome"):
+        await subject.submit_batch(
+            batch(use),
+            Cancellation(),
+            (PreToolUseOutcome("different"),),
+        )
+
+    # 对齐错误不能污染已见 ID；修正后同一批次仍能正常执行。
+    result = (await subject.submit_batch(
+        batch(use),
+        Cancellation(),
+        (PreToolUseOutcome("call"),),
+    ))[0]
+    assert result.content == "ok"
+
+
+async def test_rejected_correction_consumes_the_single_correction_allowance(tmp_path):
+    async def handler(args, ctx):
+        return args.value
+
+    subject = executor(tmp_path, [make_spec("tool", handler)])
+    bad = ToolUsePart(
+        "tool",
+        '{"value": 1, "correction_of_tool_use_id": null}',
+        "bad",
+    )
+    await subject.submit_batch(batch(bad), Cancellation())
+    correction = call("tool", "correction", correction_of_tool_use_id="bad")
+    rejected = (await subject.submit_batch(
+        batch(correction),
+        Cancellation(),
+        (PreToolUseOutcome("correction", "invalid_arguments", "still invalid"),),
+    ))[0]
+    assert rejected.failure.correctable is False
+
+    second = call("tool", "second", correction_of_tool_use_id="bad")
+    result = (await subject.submit_batch(batch(second), Cancellation()))[0]
+    assert result.failure.code == "correction_not_allowed"
 
 
 async def test_correction_cannot_reference_failure_from_same_batch(tmp_path):

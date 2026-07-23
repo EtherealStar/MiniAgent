@@ -74,11 +74,17 @@ class HookDispatcher:
                 raise
             except Exception as exc:
                 if self._trace_sink is not None:
-                    await self._trace_sink.emit({
-                        "event": "hook_notification_failed",
-                        "phase": phase,
-                        "hook_name": type(hook).__name__,
-                        "hook_index": index,
-                        "run_id": str(getattr(context, "run_id", "")),
-                        "exception_type": type(exc).__name__,
-                    })
+                    try:
+                        await self._trace_sink.emit({
+                            "event": "hook_notification_failed",
+                            "phase": phase,
+                            "hook_name": type(hook).__name__,
+                            "hook_index": index,
+                            "run_id": str(getattr(context, "run_id", "")),
+                            "exception_type": type(exc).__name__,
+                        })
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        # Trace 是可丢失诊断边界，写入失败不能改变已提交事实。
+                        pass

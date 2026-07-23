@@ -303,10 +303,50 @@ class ContextManager:
         *,
         trigger_model_call_id: UUID | None = None,
     ) -> ModelContext:
+        return await self._prepare_model_context(
+            working,
+            environment,
+            tools,
+            session,
+            trigger_model_call_id=trigger_model_call_id,
+            force_compression=False,
+        )
+
+    async def request_compression(
+        self,
+        working: WorkingContext,
+        environment: AgentRunEnvironment,
+        tools: ToolView,
+        session: ContextCommitPort,
+        *,
+        trigger_model_call_id: UUID | None = None,
+    ) -> ModelContext:
+        """为同一次 ModelCall 准备阶段显式执行至多一次额外压缩。"""
+        return await self._prepare_model_context(
+            working,
+            environment,
+            tools,
+            session,
+            trigger_model_call_id=trigger_model_call_id,
+            force_compression=True,
+        )
+
+    async def _prepare_model_context(
+        self,
+        working: WorkingContext,
+        environment: AgentRunEnvironment,
+        tools: ToolView,
+        session: ContextCommitPort,
+        *,
+        trigger_model_call_id: UUID | None,
+        force_compression: bool,
+    ) -> ModelContext:
         self._validate_working(working, environment.current_user_message_id)
         initial = self._assemble(working, environment, tools)
         initial = self._measure(initial, environment, tools)
-        if not self._at_or_above(initial.estimated_total_tokens, environment.context_window, 80):
+        if not force_compression and not self._at_or_above(
+            initial.estimated_total_tokens, environment.context_window, 80
+        ):
             return initial
 
         groups = self._compressible_groups(working, environment.current_user_message_id)

@@ -25,6 +25,7 @@ from .models import (
     ExecutionContext,
     ExecutionTraits,
     FieldError,
+    PreToolUseOutcome,
     ToolExecutionError,
     ToolFailure,
     ToolProtocolError,
@@ -100,14 +101,28 @@ class ToolExecutor:
         self._correctable: dict[str, tuple[str, bool]] = {}
         self._correction_calls: set[str] = set()
 
-    async def submit_batch(self, batch: ToolExecutionBatch, cancellation: Cancellation) -> tuple[ToolResult, ...]:
+    def validate_batch(self, batch: ToolExecutionBatch) -> None:
         ids = [use.tool_use_id for use in batch.tool_uses]
         if any(not item for item in ids) or len(ids) != len(set(ids)) or self._seen_ids.intersection(ids):
             raise ToolProtocolError("tool_use_id 缺失或重复")
+
+    async def submit_batch(
+        self,
+        batch: ToolExecutionBatch,
+        cancellation: Cancellation,
+        pre_tool_use_outcomes: tuple[PreToolUseOutcome, ...] | None = None,
+    ) -> tuple[ToolResult, ...]:
+        self.validate_batch(batch)
+        ids = [use.tool_use_id for use in batch.tool_uses]
+        outcomes = pre_tool_use_outcomes or tuple(
+            PreToolUseOutcome(tool_use_id=item) for item in ids
+        )
+        if len(outcomes) != len(ids) or [item.tool_use_id for item in outcomes] != ids:
+            raise ToolProtocolError("PreToolUse outcome 与工具批次不匹配")
         self._seen_ids.update(ids)
         correction_eligible = frozenset(self._correctable)
         prepared = [
-            await self._prepare(use, batch, correction_eligible, position)
+            await self._prepare(use, batch, correction_eligible, position, outcomes[position])
             for position, use in enumerate(batch.tool_uses)
         ]
         for item in prepared:
@@ -154,7 +169,14 @@ class ToolExecutor:
                 index += 1
         return tuple(item.result for item in prepared if item.result is not None)
 
-    async def _prepare(self, use: ToolUsePart, batch: ToolExecutionBatch, correction_eligible: frozenset[str], position: int) -> _PreparedCall:
+    async def _prepare(
+        self,
+        use: ToolUsePart,
+        batch: ToolExecutionBatch,
+        correction_eligible: frozenset[str],
+        position: int,
+        preflight: PreToolUseOutcome,
+    ) -> _PreparedCall:
         trace_id = batch.trace_id or uuid4()
         session_id = self._as_uuid(self.session_id)
         item = _PreparedCall(
@@ -174,10 +196,6 @@ class ToolExecutor:
             item.result = self._failure_result(use, batch, ToolFailure("unknown_tool", "resolve_tool", f"未知工具: {use.name}"))
             return item
         item.spec = spec
-        # Executor 仍是最终真相边界；这里与默认 PreToolUse Hook 共用同一快筛逻辑。
-        fast = fast_validate_tool_use(use, spec)
-        if not fast.valid:
-            return self._parameter_failure(item, batch, fast.code, fast.message, fast.field_errors)
         try:
             raw = json.loads(use.arguments)
         except (json.JSONDecodeError, TypeError):
@@ -189,6 +207,18 @@ class ToolExecutor:
         if correction_failure:
             item.result = self._failure_result(use, batch, correction_failure)
             return item
+        if not preflight.accepted:
+            return self._parameter_failure(
+                item,
+                batch,
+                preflight.rejection_code,
+                preflight.message,
+                preflight.field_errors,
+            )
+        # Executor 仍是最终真相边界；这里与默认 PreToolUse Hook 共用同一快筛逻辑。
+        fast = fast_validate_tool_use(use, spec)
+        if not fast.valid:
+            return self._parameter_failure(item, batch, fast.code, fast.message, fast.field_errors)
         parameters = spec.function_schema["function"]["parameters"]
         business_properties = set(parameters["properties"]) - {"correction_of_tool_use_id"}
         missing = business_properties - set(raw)

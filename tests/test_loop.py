@@ -31,7 +31,10 @@ class ReverseExecutor:
         self.batches = []
         self.timeline = timeline
 
-    async def submit_batch(self, batch, cancellation):
+    def validate_batch(self, batch):
+        pass
+
+    async def submit_batch(self, batch, cancellation, pre_tool_use_outcomes=None):
         if self.timeline is not None:
             self.timeline.append("tool")
         self.batches.append(batch)
