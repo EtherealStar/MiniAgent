@@ -35,6 +35,14 @@ class OpenAICompatibleModelAdapter:
         self._client = client or httpx.AsyncClient()
         self._closed = False
 
+    @property
+    def provider_name(self) -> str:
+        return self._configuration.chat_completions_url.split("/", 3)[2]
+
+    @property
+    def model_id(self) -> str:
+        return self._configuration.model
+
     async def stream(
         self,
         context: ModelContext,
@@ -148,7 +156,11 @@ class OpenAICompatibleModelAdapter:
                     )
         if not saw_done:
             raise _ProtocolError("SSE 流在 [DONE] 前结束")
-        yield ResponseCompleted(finish_reason=finish_reason, usage=usage)
+        yield ResponseCompleted(
+            finish_reason=finish_reason,
+            usage=usage,
+            request_id=response.headers.get("x-request-id"),
+        )
 
     @staticmethod
     async def _lines_until_cancelled(response: httpx.Response, cancellation: Cancellation) -> AsyncIterator[str]:

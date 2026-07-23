@@ -34,6 +34,7 @@ class ToolUseDelta:
 class ResponseCompleted:
     finish_reason: str | None
     usage: Usage | None = None
+    request_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

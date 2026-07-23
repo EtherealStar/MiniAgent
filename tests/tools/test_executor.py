@@ -13,6 +13,7 @@ from miniagent.tools.artifacts import MemoryTraceSink
 from miniagent.tools.executor import ToolExecutor
 from miniagent.tools.models import ExecutionTraits, ResultPolicy, RetryPolicy, ToolExecutionError, ToolProtocolError, ToolSpec
 from miniagent.tools.registry import ToolRegistry
+from miniagent.trace import TraceEventType
 
 
 class Input(BaseModel):
@@ -105,7 +106,7 @@ async def test_transient_retries_but_ordinary_failure_does_not(tmp_path):
     results = await subject.submit_batch(batch(call("retry", "r"), call("ordinary", "o")), Cancellation())
     assert results[0].content == "ok" and results[0].attempts == 3 and transient_runs == 3
     assert results[1].is_error and results[1].attempts == 1 and ordinary_runs == 1
-    assert len([event for event in trace.events if event["event"] == "retry_scheduled"]) == 2
+    assert len([event for event in trace.events if event.event_type is TraceEventType.RETRY_SCHEDULED]) == 2
 
 
 async def test_safe_segments_overlap_but_barrier_preserves_order(tmp_path):
@@ -147,9 +148,13 @@ async def test_timeout_cancellation_and_large_result(tmp_path):
     assert (tmp_path / results[1].artifact.path).read_text() == "x" * 101
 
     cancelled = Cancellation(); cancelled.cancel()
-    subject2 = executor(tmp_path, [make_spec("safe", slow), make_spec("unsafe", slow, safe=False)])
+    cancelled_trace = MemoryTraceSink()
+    subject2 = executor(tmp_path, [make_spec("safe", slow), make_spec("unsafe", slow, safe=False)], cancelled_trace)
     results = await subject2.submit_batch(batch(call("safe", "cs"), call("unsafe", "cu")), cancelled)
     assert [result.failure.code for result in results] == ["cancelled", "outcome_unknown"]
+    starts = [event for event in cancelled_trace.events if event.event_type is TraceEventType.SPAN_STARTED]
+    finishes = [event for event in cancelled_trace.events if event.event_type is TraceEventType.SPAN_FINISHED]
+    assert len(starts) == len(finishes) == 2
 
 
 async def test_running_cancellation_stops_later_barrier(tmp_path):

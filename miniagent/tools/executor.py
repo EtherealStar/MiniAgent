@@ -5,11 +5,20 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from pydantic import ValidationError
 
 from miniagent.domain import ToolExecutionBatch, ToolResult, ToolUsePart
 from miniagent.ports import Cancellation
+from miniagent.trace import (
+    BestEffortTraceSink,
+    TraceContext,
+    TraceEventType,
+    TraceRecorder,
+    TraceSpan,
+    TraceStatus,
+)
 
 from .artifacts import FileArtifactStore, MemoryTraceSink
 from .models import (
@@ -23,6 +32,7 @@ from .models import (
 )
 from .policy import TargetPolicyError
 from .registry import ToolRegistryView
+from .validation import fast_validate_tool_use
 
 
 @dataclass(slots=True)
@@ -33,6 +43,9 @@ class _PreparedCall:
     targets: tuple = ()
     traits: ExecutionTraits = ExecutionTraits()
     result: ToolResult | None = None
+    trace_context: TraceContext | None = None
+    trace_span: TraceSpan | None = None
+    batch_position: int = 0
 
 
 class _AttemptCancellation:
@@ -76,7 +89,13 @@ class ToolExecutor:
         self.workspace_root = workspace_root.resolve(strict=True)
         self.session_id = session_id
         self.artifact_store = artifact_store or FileArtifactStore(self.workspace_root)
-        self.trace_sink = trace_sink or MemoryTraceSink()
+        raw_trace_sink = trace_sink or MemoryTraceSink()
+        self.trace_sink = (
+            raw_trace_sink
+            if isinstance(raw_trace_sink, BestEffortTraceSink)
+            else BestEffortTraceSink(raw_trace_sink)
+        )
+        self._trace_recorder = TraceRecorder(self.trace_sink)
         self._seen_ids: set[str] = set()
         self._correctable: dict[str, tuple[str, bool]] = {}
         self._correction_calls: set[str] = set()
@@ -87,10 +106,15 @@ class ToolExecutor:
             raise ToolProtocolError("tool_use_id 缺失或重复")
         self._seen_ids.update(ids)
         correction_eligible = frozenset(self._correctable)
-        prepared = [await self._prepare(use, batch, correction_eligible) for use in batch.tool_uses]
+        prepared = [
+            await self._prepare(use, batch, correction_eligible, position)
+            for position, use in enumerate(batch.tool_uses)
+        ]
         for item in prepared:
             if item.result is not None and item.result.is_error:
-                await self._trace("call_error", item.use, attempt=0, status=item.result.status)
+                await self._trace("call_started", item, attempt=0)
+                await self._trace("call_error", item, attempt=0, status=item.result.status)
+                await self._trace("call_finished", item, attempt=0, status=item.result.status)
         index = 0
         while index < len(prepared):
             current = prepared[index]
@@ -101,6 +125,21 @@ class ToolExecutor:
                 for pending in prepared[index:]:
                     if pending.result is None:
                         pending.result = self._cancelled_result(pending, batch)
+                        await self._trace("call_started", pending, attempt=0)
+                        await self._trace(
+                            "call_error",
+                            pending,
+                            attempt=0,
+                            status=pending.result.status,
+                            outcome_unknown=pending.result.outcome_unknown,
+                        )
+                        await self._trace(
+                            "call_finished",
+                            pending,
+                            attempt=0,
+                            status=pending.result.status,
+                            outcome_unknown=pending.result.outcome_unknown,
+                        )
                 break
             if current.traits.concurrency_safe:
                 end = index
@@ -115,13 +154,30 @@ class ToolExecutor:
                 index += 1
         return tuple(item.result for item in prepared if item.result is not None)
 
-    async def _prepare(self, use: ToolUsePart, batch: ToolExecutionBatch, correction_eligible: frozenset[str]) -> _PreparedCall:
-        item = _PreparedCall(use)
+    async def _prepare(self, use: ToolUsePart, batch: ToolExecutionBatch, correction_eligible: frozenset[str], position: int) -> _PreparedCall:
+        trace_id = batch.trace_id or uuid4()
+        session_id = self._as_uuid(self.session_id)
+        item = _PreparedCall(
+            use,
+            trace_context=TraceContext(
+                trace_id,
+                uuid4(),
+                batch.parent_span_id,
+                session_id,
+                batch.run_id,
+                batch.assistant_message_id,
+            ),
+            batch_position=position,
+        )
         spec = self.registry.get(use.name)
         if spec is None:
             item.result = self._failure_result(use, batch, ToolFailure("unknown_tool", "resolve_tool", f"未知工具: {use.name}"))
             return item
         item.spec = spec
+        # Executor 仍是最终真相边界；这里与默认 PreToolUse Hook 共用同一快筛逻辑。
+        fast = fast_validate_tool_use(use, spec)
+        if not fast.valid:
+            return self._parameter_failure(item, batch, fast.code, fast.message, fast.field_errors)
         try:
             raw = json.loads(use.arguments)
         except (json.JSONDecodeError, TypeError):
@@ -187,14 +243,14 @@ class ToolExecutor:
 
     async def _execute(self, item: _PreparedCall, batch: ToolExecutionBatch, cancellation: Cancellation) -> ToolResult:
         assert item.spec is not None
-        await self._trace("call_started", item.use, attempt=0)
+        await self._trace("call_started", item, attempt=0)
         attempts = 0
         while attempts < item.spec.retry_policy.max_attempts:
             if cancellation.cancelled:
                 code = "cancelled" if item.traits.concurrency_safe else "outcome_unknown"
                 return await self._execution_failure(item, batch, attempts, code, "工具执行已取消", code == "outcome_unknown")
             attempts += 1
-            await self._trace("attempt_started", item.use, attempt=attempts)
+            await self._trace("attempt_started", item, attempt=attempts)
             attempt_cancellation = _AttemptCancellation(cancellation)
             context = ExecutionContext(
                 session_id=self.session_id,
@@ -220,7 +276,7 @@ class ToolExecutor:
                         f"preview:\n{preview}"
                     )
                 result = ToolResult(item.use.tool_use_id, batch.assistant_message_id, visible, tool_name=item.use.name, attempts=attempts, artifact=artifact)
-                await self._trace("call_finished", item.use, attempt=attempts, status="success")
+                await self._trace("call_finished", item, attempt=attempts, status="success", result_bytes=len(encoded))
                 return result
             except asyncio.TimeoutError:
                 code = "timeout" if item.traits.concurrency_safe else "outcome_unknown"
@@ -230,7 +286,7 @@ class ToolExecutor:
                 return await self._execution_failure(item, batch, attempts, code, "工具执行已取消", code == "outcome_unknown")
             except ToolExecutionError as exc:
                 if exc.transient and not exc.outcome_unknown and attempts < item.spec.retry_policy.max_attempts:
-                    await self._trace("retry_scheduled", item.use, attempt=attempts)
+                    await self._trace("retry_scheduled", item, attempt=attempts)
                     if item.spec.retry_policy.retry_delay_seconds:
                         try:
                             await asyncio.wait_for(cancellation.wait(), timeout=item.spec.retry_policy.retry_delay_seconds)
@@ -273,8 +329,8 @@ class ToolExecutor:
     async def _execution_failure(self, item, batch, attempts, code, message, unknown, retryable=False):
         failure = ToolFailure(code, "execution", message, retryable=retryable)
         result = self._failure_result(item.use, batch, failure, attempts, unknown)
-        await self._trace("call_error", item.use, attempt=attempts, status=code)
-        await self._trace("call_finished", item.use, attempt=attempts, status=code)
+        await self._trace("call_error", item, attempt=attempts, status=code, outcome_unknown=unknown)
+        await self._trace("call_finished", item, attempt=attempts, status=code, outcome_unknown=unknown)
         return result
 
     def _cancelled_result(self, item, batch):
@@ -291,5 +347,37 @@ class ToolExecutor:
         )
         return ToolResult(use.tool_use_id, batch.assistant_message_id, content, True, outcome_unknown, use.name, failure.code, attempts, failure)
 
-    async def _trace(self, event, use, **fields):
-        await self.trace_sink.emit({"event": event, "tool_use_id": use.tool_use_id, "tool_name": use.name, **fields})
+    async def _trace(self, event, item: _PreparedCall, **fields):
+        assert item.trace_context is not None
+        payload = {
+            "tool_use_id": item.use.tool_use_id,
+            "tool_name": item.use.name,
+            "assistant_message_id": str(item.trace_context.message_id),
+            "batch_position": item.batch_position,
+            **fields,
+        }
+        if event == "call_started":
+            item.trace_span = await self._trace_recorder.start_span(
+                "tool.call", item.trace_context, **payload
+            )
+        elif event == "attempt_started":
+            await self._trace_recorder.emit(TraceEventType.ATTEMPT_STARTED, item.trace_context, payload)
+        elif event == "retry_scheduled":
+            await self._trace_recorder.emit(TraceEventType.RETRY_SCHEDULED, item.trace_context, payload)
+        elif event == "call_error":
+            await self._trace_recorder.emit(TraceEventType.TOOL_FINISHED, item.trace_context, payload)
+        elif event == "call_finished":
+            if fields.get("status") == "success":
+                await self._trace_recorder.emit(TraceEventType.TOOL_FINISHED, item.trace_context, payload)
+            if item.trace_span is not None:
+                status = TraceStatus.OK if fields.get("status") == "success" else TraceStatus.ERROR
+                finish_payload = {key: value for key, value in payload.items() if key != "status"}
+                finish_payload["outcome_status"] = fields.get("status")
+                await item.trace_span.finish(status, **finish_payload)
+
+    @staticmethod
+    def _as_uuid(value: str) -> UUID:
+        try:
+            return UUID(value)
+        except ValueError:
+            return uuid5(NAMESPACE_URL, value)

@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 
+from miniagent.trace import MemoryTraceSink
+
 from .models import ArtifactRef, ToolProtocolError
 
 
@@ -52,11 +54,3 @@ class FileArtifactStore:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-
-
-class MemoryTraceSink:
-    def __init__(self) -> None:
-        self.events: list[dict[str, object]] = []
-
-    async def emit(self, event) -> None:
-        self.events.append(dict(event))

@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from typing import AsyncIterator, Protocol
+from uuid import UUID
 
-from .domain import Message, ToolExecutionBatch, ToolResult, ToolSpec
+from .domain import AgentRunResult, ContextSummary, Message, ToolExecutionBatch, ToolResult, ToolSpec
 from .provider.events import ModelEvent
 
 
@@ -61,5 +62,10 @@ class ToolExecutor(Protocol):
     ) -> tuple[ToolResult, ...]: ...
 
 
-class EventSink(Protocol):
-    async def emit(self, payload: object) -> object: ...
+class RunCommitter(Protocol):
+    session_id: UUID
+    async def commit_assistant(self, run_id: UUID, message: Message, finish_reason: str | None) -> None: ...
+    async def commit_tool_result(self, run_id: UUID, message: Message) -> None: ...
+    async def commit_context_summary(self, run_id: UUID, summary: ContextSummary) -> None: ...
+    async def finish_run(self, run_id: UUID, result: AgentRunResult) -> None: ...
+    async def publish_live(self, update: object) -> None: ...

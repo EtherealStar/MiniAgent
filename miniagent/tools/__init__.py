@@ -12,6 +12,7 @@ from .models import (
     ToolTarget,
 )
 from .registry import ToolRegistry, ToolRegistryView
+from .validation import FastValidationResult, fast_validate_tool_use
 
 
 def build_default_registry() -> ToolRegistry:
@@ -24,5 +25,5 @@ def build_default_registry() -> ToolRegistry:
 __all__ = [
     "ArtifactRef", "ExecutionContext", "ExecutionTraits", "FieldError", "ResultPolicy",
     "RetryPolicy", "ToolExecutionError", "ToolFailure", "ToolProtocolError", "ToolRegistry",
-    "ToolRegistryView", "ToolSpec", "ToolTarget", "build_default_registry",
+    "ToolRegistryView", "ToolSpec", "ToolTarget", "build_default_registry", "FastValidationResult", "fast_validate_tool_use",
 ]

@@ -6,6 +6,8 @@ from typing import Any, Awaitable, Callable, Mapping, Protocol
 
 from pydantic import BaseModel
 
+from miniagent.trace import TraceSink
+
 
 SYSTEM_RESULT_HARD_LIMIT_BYTES = 50 * 1024
 
@@ -70,10 +72,6 @@ class ResultPolicy:
             raise ValueError("工具不能提高系统结果硬上限")
         if self.threshold_bytes > self.hard_limit_bytes:
             raise ValueError("工具结果阈值不能超过系统硬上限")
-
-
-class TraceSink(Protocol):
-    async def emit(self, event: Mapping[str, object]) -> None: ...
 
 
 class ArtifactStore(Protocol):

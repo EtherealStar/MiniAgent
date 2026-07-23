@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from uuid import UUID, uuid4
 
@@ -18,21 +19,18 @@ from .domain import (
     ToolSpec,
     ToolUsePart,
 )
-from .events import (
-    AssistantMessageCompleted,
+from .updates import (
     AssistantMessageDiscarded,
     AssistantMessageStarted,
     AssistantPartDelta,
-    RunTerminated,
-    ToolResultRecorded,
     ToolUseDetected,
-    UserMessageRecorded,
 )
-from .ports import Cancellation, EventSink, GenerationOptions, ModelAdapter, ToolExecutor
+from .ports import Cancellation, GenerationOptions, ModelAdapter, RunCommitter, ToolExecutor
 from .provider.errors import ProviderNotConfiguredError
 from .provider.events import ReasoningDelta, ResponseCompleted, ResponseFailed, TextDelta, ToolUseDelta
 from .session import EventCommitError
 from .text_processing import PassthroughTextProcessor
+from .trace import NullTraceSink, TraceContext, TraceEventType, TraceRecorder, TraceStatus, sanitize_error
 
 
 @dataclass(slots=True)
@@ -52,6 +50,7 @@ class AgentLoop:
         options: GenerationOptions | None = None,
         context_budget: int = 16_000,
         text_processor_factory=PassthroughTextProcessor,
+        trace_sink=None,
     ) -> None:
         self._model = model
         self._context_builder = context_builder
@@ -60,6 +59,9 @@ class AgentLoop:
         self._options = options or GenerationOptions()
         self._context_budget = context_budget
         self._text_processor_factory = text_processor_factory
+        self._trace_sink = trace_sink or NullTraceSink()
+        self._provider_name = getattr(model, "provider_name", type(model).__name__)
+        self._model_id = getattr(model, "model_id", None)
 
     async def run(
         self,
@@ -67,7 +69,7 @@ class AgentLoop:
         user_message: Message,
         system_prompt: str,
         max_turns: int,
-        event_sink: EventSink,
+        committer: RunCommitter,
         cancellation: Cancellation,
         run_id: UUID | None = None,
     ) -> AgentRunResult:
@@ -75,6 +77,8 @@ class AgentLoop:
             raise ValueError("max_turns 必须为正整数")
         if user_message.role is not Role.USER:
             raise ValueError("user_message 必须是 user 角色")
+        if not any(message.message_id == user_message.message_id for message in initial_messages):
+            raise ValueError("AgentLoop 只能接收已经提交的 user_message")
         actual_run_id = run_id or uuid4()
         working = list(initial_messages)
         turn_count = 0
@@ -82,15 +86,34 @@ class AgentLoop:
         continuation_of: UUID | None = None
         retry_of: UUID | None = None
         compression_used = False
+        recorder = TraceRecorder(self._trace_sink)
+        run_context = TraceContext(uuid4(), uuid4(), None, committer.session_id, actual_run_id, user_message.message_id)
+        run_span = await recorder.start_span(
+            "agent.run", run_context, input_message_id=str(user_message.message_id)
+        )
+
+        async def finish(reason, turns, final_id, error_message=None):
+            result = AgentRunResult(
+                reason=reason,
+                turn_count=turns,
+                final_message_id=final_id,
+                error=ErrorInfo(category=reason.value.lower(), message=error_message) if error_message else None,
+            )
+            await committer.finish_run(actual_run_id, result)
+            await run_span.finish(
+                TraceStatus.CANCELLED if reason is StopReason.CANCELLED else TraceStatus.OK,
+                turn_count=turns,
+                stop_reason=reason.value,
+                final_message_id=str(final_id) if final_id else None,
+            )
+            return result
 
         try:
-            await event_sink.emit(UserMessageRecorded(message=user_message))
-            working.append(user_message)
             while True:
                 if cancellation.cancelled:
-                    return await self._finish(event_sink, StopReason.CANCELLED, turn_count, final_message_id)
+                    return await finish(StopReason.CANCELLED, turn_count, final_message_id)
                 if turn_count >= max_turns:
-                    return await self._finish(event_sink, StopReason.MAX_TURNS, turn_count, final_message_id)
+                    return await finish(StopReason.MAX_TURNS, turn_count, final_message_id)
 
                 current = WorkingContext(messages=tuple(working))
                 context = (
@@ -99,7 +122,32 @@ class AgentLoop:
                     else self._context_builder.build(current, system_prompt, self._context_budget)
                 )
                 message_id = uuid4()
-                await event_sink.emit(AssistantMessageStarted(
+                turn_context = run_context.child(message_id=message_id)
+                context_bytes = self._context_size(context)
+                turn_span = await recorder.start_span(
+                    "agent.turn",
+                    turn_context,
+                    turn=turn_count + 1,
+                    continuation_of_message_id=str(continuation_of) if continuation_of else None,
+                    retry_of_message_id=str(retry_of) if retry_of else None,
+                    context_message_count=len(context.messages),
+                    context_bytes=context_bytes,
+                    compressed=compression_used,
+                )
+                model_context = turn_context.child(message_id=message_id)
+                model_span = await recorder.start_span(
+                    "model.call",
+                    model_context,
+                    provider=self._provider_name,
+                    model=self._model_id,
+                    input_message_count=len(context.messages),
+                    input_bytes=context_bytes,
+                    temperature=self._options.temperature,
+                    max_tokens=self._options.max_tokens,
+                    tool_choice=self._options.tool_choice,
+                    retry_of_message_id=str(retry_of) if retry_of else None,
+                )
+                await committer.publish_live(AssistantMessageStarted(
                     message_id=message_id,
                     continuation_of_message_id=continuation_of,
                     retry_of_message_id=retry_of,
@@ -111,6 +159,21 @@ class AgentLoop:
                 reasoning_chunks: list[list[str]] = []
                 tool_drafts: dict[int, _ToolDraft] = {}
                 terminal: ResponseCompleted | ResponseFailed | None = None
+                text_delta_count = reasoning_delta_count = tool_delta_count = 0
+                text_bytes = reasoning_bytes = tool_bytes = 0
+                stream_started_ns = time.monotonic_ns()
+                first_delta_ns: int | None = None
+                last_delta_ns: int | None = None
+                intervals_ms: list[float] = []
+
+                def observe_delta() -> None:
+                    nonlocal first_delta_ns, last_delta_ns
+                    now = time.monotonic_ns()
+                    if first_delta_ns is None:
+                        first_delta_ns = now
+                    if last_delta_ns is not None:
+                        intervals_ms.append((now - last_delta_ns) / 1_000_000)
+                    last_delta_ns = now
 
                 try:
                     async for raw_event in self._model.stream(context, self._tools, self._options, cancellation):
@@ -119,66 +182,123 @@ class AgentLoop:
                             if terminal is not None:
                                 raise RuntimeError("模型终态之后出现额外事件")
                             if isinstance(event, TextDelta):
+                                observe_delta()
+                                text_delta_count += 1
+                                text_bytes += len(event.content.encode("utf-8"))
                                 if not part_order or part_order[-1][0] != "text":
                                     text_chunks.append([])
                                     part_order.append(("text", len(text_chunks) - 1))
                                 text_chunks[-1].append(event.content)
-                                await event_sink.emit(AssistantPartDelta(message_id=message_id, kind="text", content=event.content))
+                                await committer.publish_live(AssistantPartDelta(message_id=message_id, kind="text", content=event.content))
                             elif isinstance(event, ReasoningDelta):
+                                observe_delta()
+                                reasoning_delta_count += 1
+                                reasoning_bytes += len(event.content.encode("utf-8"))
                                 if not part_order or part_order[-1][0] != "reasoning":
                                     reasoning_chunks.append([])
                                     part_order.append(("reasoning", len(reasoning_chunks) - 1))
                                 reasoning_chunks[-1].append(event.content)
-                                await event_sink.emit(AssistantPartDelta(message_id=message_id, kind="reasoning", content=event.content))
+                                await committer.publish_live(AssistantPartDelta(message_id=message_id, kind="reasoning", content=event.content))
                             elif isinstance(event, ToolUseDelta):
+                                observe_delta()
+                                tool_delta_count += 1
+                                tool_bytes += len(event.arguments_fragment.encode("utf-8"))
                                 draft = tool_drafts.setdefault(event.index, _ToolDraft())
                                 if ("tool", event.index) not in part_order:
                                     part_order.append(("tool", event.index))
                                 draft.tool_use_id += event.tool_use_id_fragment
                                 draft.name += event.name_fragment
                                 draft.arguments += event.arguments_fragment
-                                await event_sink.emit(AssistantPartDelta(message_id=message_id, kind="tool", content=event.arguments_fragment))
+                                await committer.publish_live(AssistantPartDelta(message_id=message_id, kind="tool", content=event.arguments_fragment))
                             elif isinstance(event, (ResponseCompleted, ResponseFailed)):
                                 terminal = event
                             else:
                                 raise TypeError(f"未知 ModelEvent: {type(event)!r}")
                     for event in processor.finish():
                         if isinstance(event, TextDelta):
+                            observe_delta()
                             text_chunks.append([event.content])
                             part_order.append(("text", len(text_chunks) - 1))
-                            await event_sink.emit(AssistantPartDelta(message_id=message_id, kind="text", content=event.content))
+                            await committer.publish_live(AssistantPartDelta(message_id=message_id, kind="text", content=event.content))
                         elif isinstance(event, ReasoningDelta):
+                            observe_delta()
                             reasoning_chunks.append([event.content])
                             part_order.append(("reasoning", len(reasoning_chunks) - 1))
-                            await event_sink.emit(AssistantPartDelta(message_id=message_id, kind="reasoning", content=event.content))
+                            await committer.publish_live(AssistantPartDelta(message_id=message_id, kind="reasoning", content=event.content))
                 except asyncio.CancelledError:
-                    await event_sink.emit(AssistantMessageDiscarded(message_id=message_id, reason="cancelled"))
-                    return await self._finish(event_sink, StopReason.CANCELLED, turn_count, final_message_id)
+                    await model_span.finish(TraceStatus.CANCELLED)
+                    await turn_span.finish(TraceStatus.CANCELLED)
+                    await committer.publish_live(AssistantMessageDiscarded(message_id=message_id, reason="cancelled"))
+                    return await finish(StopReason.CANCELLED, turn_count, final_message_id)
                 except ProviderNotConfiguredError as exc:
                     # 配置错误发生在 HTTP 请求前，不应计入实际 ModelCall。
                     turn_count -= 1
-                    await event_sink.emit(AssistantMessageDiscarded(message_id=message_id, reason="model_unavailable"))
-                    return await self._finish(event_sink, StopReason.MODEL_UNAVAILABLE, turn_count, final_message_id, str(exc))
+                    await model_span.finish(TraceStatus.ERROR, error_category="model_unavailable")
+                    await turn_span.finish(TraceStatus.ERROR)
+                    await committer.publish_live(AssistantMessageDiscarded(message_id=message_id, reason="model_unavailable"))
+                    return await finish(StopReason.MODEL_UNAVAILABLE, turn_count, final_message_id, str(exc))
 
                 if terminal is None:
+                    terminal_received = False
                     terminal = ResponseFailed(category="protocol_error", message="模型流缺少终态")
+                else:
+                    terminal_received = True
+
+                await recorder.emit(TraceEventType.STREAM_SUMMARY, model_context, {
+                    "text_delta_count": text_delta_count,
+                    "text_bytes": text_bytes,
+                    "reasoning_delta_count": reasoning_delta_count,
+                    "reasoning_bytes": reasoning_bytes,
+                    "tool_delta_count": tool_delta_count,
+                    "tool_bytes": tool_bytes,
+                    "terminal_received": terminal_received,
+                    "cancelled": False,
+                    "first_delta_ms": None if first_delta_ns is None else (first_delta_ns - stream_started_ns) / 1_000_000,
+                    "last_delta_ms": None if last_delta_ns is None else (last_delta_ns - stream_started_ns) / 1_000_000,
+                    "interval_count": len(intervals_ms),
+                    "interval_min_ms": min(intervals_ms) if intervals_ms else None,
+                    "interval_max_ms": max(intervals_ms) if intervals_ms else None,
+                    "interval_avg_ms": sum(intervals_ms) / len(intervals_ms) if intervals_ms else None,
+                    "duration_ms": (time.monotonic_ns() - stream_started_ns) / 1_000_000,
+                })
 
                 if isinstance(terminal, ResponseFailed):
-                    await event_sink.emit(AssistantMessageDiscarded(message_id=message_id, reason=terminal.category))
+                    safe_error = sanitize_error({
+                        "category": terminal.category,
+                        "type": terminal.provider_type or "ProviderError",
+                        "message": terminal.message,
+                        "provider_code": terminal.provider_code,
+                        "status_code": terminal.status_code,
+                        "request_id": terminal.request_id,
+                    })
+                    await model_span.finish(TraceStatus.ERROR, error=safe_error)
+                    await turn_span.finish(TraceStatus.ERROR)
+                    await committer.publish_live(AssistantMessageDiscarded(message_id=message_id, reason=terminal.category))
                     if self._is_prompt_too_long(terminal):
                         if compression_used:
-                            return await self._finish(event_sink, StopReason.PROMPT_TOO_LONG, turn_count, final_message_id, terminal.message)
+                            return await finish(StopReason.PROMPT_TOO_LONG, turn_count, final_message_id, terminal.message)
                         compressed = self._context_builder.force_compress(current, system_prompt, self._context_budget)
                         if self._context_size(compressed) >= self._context_size(context):
-                            return await self._finish(event_sink, StopReason.PROMPT_TOO_LONG, turn_count, final_message_id, "强制压缩未减少输入")
+                            return await finish(StopReason.PROMPT_TOO_LONG, turn_count, final_message_id, "强制压缩未减少输入")
                         compression_used = True
                         retry_of = message_id
                         continue
                     if terminal.category in {"authentication", "client_error"}:
-                        return await self._finish(event_sink, StopReason.MODEL_UNAVAILABLE, turn_count, final_message_id, terminal.message)
+                        return await finish(StopReason.MODEL_UNAVAILABLE, turn_count, final_message_id, terminal.message)
                     retry_of = message_id
                     continuation_of = None
                     continue
+
+                await model_span.finish(
+                    TraceStatus.OK,
+                    finish_reason=terminal.finish_reason,
+                    usage=None if terminal.usage is None else {
+                        "prompt_tokens": terminal.usage.prompt_tokens,
+                        "completion_tokens": terminal.usage.completion_tokens,
+                        "total_tokens": terminal.usage.total_tokens,
+                    },
+                    request_id=terminal.request_id,
+                )
 
                 parts = []
                 for kind, index in part_order:
@@ -203,8 +323,8 @@ class AgentLoop:
                     retry_of_message_id=retry_of,
                 )
                 for tool in (part for part in parts if isinstance(part, ToolUsePart)):
-                    await event_sink.emit(ToolUseDetected(message_id=message_id, tool_use_id=tool.tool_use_id, name=tool.name, arguments=tool.arguments))
-                await event_sink.emit(AssistantMessageCompleted(message=assistant, finish_reason=terminal.finish_reason))
+                    await committer.publish_live(ToolUseDetected(message_id=message_id, tool_use_id=tool.tool_use_id, name=tool.name, arguments=tool.arguments))
+                await committer.commit_assistant(actual_run_id, assistant, terminal.finish_reason)
                 working.append(assistant)
                 final_message_id = message_id
                 tool_uses = tuple(part for part in parts if isinstance(part, ToolUsePart))
@@ -212,11 +332,18 @@ class AgentLoop:
                 if tool_uses:
                     if self._tool_executor is None:
                         raise RuntimeError("模型产生工具调用，但未配置 ToolExecutor")
-                    batch = ToolExecutionBatch(run_id=actual_run_id, assistant_message_id=message_id, tool_uses=tool_uses)
+                    batch = ToolExecutionBatch(
+                        run_id=actual_run_id,
+                        assistant_message_id=message_id,
+                        tool_uses=tool_uses,
+                        trace_id=run_context.trace_id,
+                        parent_span_id=turn_context.span_id,
+                    )
                     try:
                         results = await self._tool_executor.submit_batch(batch, cancellation)
                     except asyncio.CancelledError:
-                        return await self._finish(event_sink, StopReason.CANCELLED, turn_count, final_message_id)
+                        await turn_span.finish(TraceStatus.CANCELLED)
+                        return await finish(StopReason.CANCELLED, turn_count, final_message_id)
                     ordered = self._order_results(tool_uses, results, message_id)
                     for result in ordered:
                         tool_message = Message(
@@ -229,10 +356,18 @@ class AgentLoop:
                                 outcome_unknown=result.outcome_unknown,
                             ),),
                         )
-                        await event_sink.emit(ToolResultRecorded(message=tool_message))
+                        await committer.commit_tool_result(actual_run_id, tool_message)
                         working.append(tool_message)
                     if cancellation.cancelled:
-                        return await self._finish(event_sink, StopReason.CANCELLED, turn_count, final_message_id)
+                        await turn_span.finish(TraceStatus.CANCELLED)
+                        return await finish(StopReason.CANCELLED, turn_count, final_message_id)
+
+                await turn_span.finish(
+                    TraceStatus.OK,
+                    assistant_message_id=str(message_id),
+                    tool_count=len(tool_uses),
+                    finish_reason=terminal.finish_reason,
+                )
 
                 if terminal.finish_reason == "length":
                     continuation_of = message_id
@@ -242,8 +377,9 @@ class AgentLoop:
                     continuation_of = None
                     retry_of = None
                     continue
-                return await self._finish(event_sink, StopReason.COMPLETED, turn_count, final_message_id)
+                return await finish(StopReason.COMPLETED, turn_count, final_message_id)
         except EventCommitError as exc:
+            await run_span.finish(TraceStatus.ERROR, error_category="event_commit")
             return AgentRunResult(
                 reason=StopReason.EVENT_COMMIT_FAILED,
                 turn_count=turn_count,
@@ -272,12 +408,3 @@ class AgentLoop:
             raise RuntimeError("ToolResult 的 assistant_message_id 不匹配")
         return tuple(by_id[tool.tool_use_id] for tool in tool_uses)
 
-    @staticmethod
-    async def _finish(event_sink, reason, turn_count, final_message_id, error_message=None):
-        await event_sink.emit(RunTerminated(reason=reason.value, turn_count=turn_count))
-        return AgentRunResult(
-            reason=reason,
-            turn_count=turn_count,
-            final_message_id=final_message_id,
-            error=ErrorInfo(category=reason.value.lower(), message=error_message) if error_message else None,
-        )

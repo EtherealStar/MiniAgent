@@ -2,28 +2,39 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
-from .domain import Message
-from .events import (
-    AssistantMessageCompleted,
-    AssistantMessageDiscarded,
-    AssistantMessageStarted,
-    EventPayload,
-    SessionEvent,
-    ToolResultRecorded,
-    UserMessageRecorded,
+from .domain import AgentRunResult, ContextSummary, ErrorInfo, Message, Role, StopReason
+from .journal import (
+    AssistantMessagePayload,
+    ContextSummaryPayload,
+    JournalRecord,
+    JournalRecordType,
+    RunTerminatedPayload,
+    ToolResultPayload,
+    UserMessagePayload,
 )
+from .repository import OpenSession
 from .ports import Cancellation
-from .storage import TranscriptStore
+from .updates import (
+    AssistantMessageCompleted,
+    RunTerminated,
+    ToolResultCompleted,
+    UserMessageCommitted,
+    InputQueued,
+    InputWithdrawn,
+)
+from .trace import sanitize_error
 
 
 class EventCommitError(RuntimeError):
     pass
 
 
-UiSink = Callable[[SessionEvent], Awaitable[None]]
+UiSink = Callable[[object], Awaitable[None]]
+Clock = Callable[[], datetime]
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,135 +44,199 @@ class QueuedInput:
 
 
 class SessionEngine:
-    """会话事件的唯一写入边界，并维护可重放的消息投影。"""
+    """Transcript 的唯一提交者；运行时通知不参与 Journal 恢复。"""
 
-    def __init__(self, session_id: UUID | None = None, ui_sink: UiSink | None = None, transcript_store: TranscriptStore | None = None) -> None:
-        self.session_id = session_id or uuid4()
+    def __init__(
+        self,
+        opened: OpenSession,
+        *,
+        ui_sink: UiSink | None = None,
+        clock: Clock | None = None,
+    ) -> None:
+        self._opened = opened
+        self.session_id = opened.session_id
         self._ui_sink = ui_sink
-        self._transcript_store = transcript_store
-        self._events: list[SessionEvent] = []
-        self._event_ids: dict[UUID, SessionEvent] = {}
-        self._messages: list[Message] = []
-        self._drafts: set[UUID] = set()
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._messages = list(opened.recovered.messages)
+        self._context_summaries = list(opened.recovered.context_summaries)
+        self._run_results = list(opened.recovered.run_results)
+        self._failed = False
         self._queue: asyncio.Queue[QueuedInput] = asyncio.Queue()
-        self._cancellations: dict[UUID, Cancellation] = {}
-        self._active_run_id: UUID | None = None
-        self._recovered_runs: set[UUID] = set()
+        self._queued_ids: set[UUID] = set()
+        self._withdrawn_ids: set[UUID] = set()
+        self._run_lock = asyncio.Lock()
         self.ui_delivery_errors: list[Exception] = []
-        self._lock = asyncio.Lock()
-
-    @property
-    def events(self) -> tuple[SessionEvent, ...]:
-        return tuple(self._events)
 
     @property
     def messages(self) -> tuple[Message, ...]:
         return tuple(self._messages)
 
-    def begin_run(self, run_id: UUID | None = None) -> tuple[UUID, Cancellation]:
-        if self._active_run_id is not None:
-            raise RuntimeError("同一 Session 同时只能运行一个 AgentRun")
-        actual = run_id or uuid4()
-        cancellation = Cancellation()
-        self._active_run_id = actual
-        self._cancellations[actual] = cancellation
-        return actual, cancellation
+    @property
+    def context_summaries(self) -> tuple[ContextSummary, ...]:
+        return tuple(self._context_summaries)
 
-    def finish_run(self, run_id: UUID) -> None:
-        if self._active_run_id == run_id:
-            self._active_run_id = None
+    @property
+    def run_results(self) -> tuple[AgentRunResult, ...]:
+        return tuple(self._run_results)
 
-    async def enqueue_input(self, message: Message) -> UUID:
-        run_id = uuid4()
-        await self._queue.put(QueuedInput(run_id=run_id, message=message))
-        return run_id
+    @property
+    def failed(self) -> bool:
+        return self._failed
 
-    async def next_input(self) -> QueuedInput:
-        return await self._queue.get()
+    async def submit(self, text: str) -> QueuedInput:
+        if self._failed:
+            raise EventCommitError("Session 已失效，不能继续排队输入")
+        if not text.strip():
+            raise ValueError("输入不能为空")
+        queued = QueuedInput(uuid4(), Message.text(Role.USER, text))
+        self._queued_ids.add(queued.message.message_id)
+        await self._queue.put(queued)
+        await self.publish_live(InputQueued(queued.run_id, queued.message))
+        return queued
 
-    def cancel(self, run_id: UUID) -> bool:
-        signal = self._cancellations.get(run_id)
-        if signal is None:
+    async def withdraw(self, message_id: UUID) -> bool:
+        if message_id not in self._queued_ids or message_id in self._withdrawn_ids:
             return False
-        signal.cancel()
+        self._withdrawn_ids.add(message_id)
+        await self.publish_live(InputWithdrawn(message_id))
         return True
 
-    async def emit(self, payload: EventPayload) -> SessionEvent:
-        if self._active_run_id is None:
-            raise EventCommitError("没有活动的 AgentRun")
-        async with self._lock:
-            existing = self._event_ids.get(payload.event_id)
-            if existing is not None:
-                return existing
-            event = SessionEvent.create(
-                session_id=self.session_id,
-                run_id=self._active_run_id,
-                sequence=len(self._events) + 1,
-                payload=payload,
-            )
-            self._validate_projection(payload)
-            if self._transcript_store is not None:
-                try:
-                    await self._transcript_store.append(event)
-                except Exception as exc:
-                    raise EventCommitError("transcript 持久化失败") from exc
-            # 持久化确认后才更新内存投影，失败内容不会进入 Working Context。
-            self._apply_projection(payload)
-            self._events.append(event)
-            self._event_ids[event.event_id] = event
-        if self._ui_sink is not None:
+    async def run_next(
+        self,
+        agent_loop,
+        system_prompt: str,
+        max_turns: int,
+        cancellation: Cancellation | None = None,
+    ) -> AgentRunResult:
+        async with self._run_lock:
+            while True:
+                queued = await self._queue.get()
+                self._queued_ids.discard(queued.message.message_id)
+                if queued.message.message_id in self._withdrawn_ids:
+                    self._withdrawn_ids.discard(queued.message.message_id)
+                    self._queue.task_done()
+                    continue
+                break
             try:
-                await self._ui_sink(event)
-            except Exception as exc:  # UI 断线不改变 AgentRun 控制流。
-                self.ui_delivery_errors.append(exc)
-        return event
+                # 这是后续输入进入 AgentLoop 的唯一公开路径；提交失败时不会调用模型。
+                await self.commit_user(queued.run_id, queued.message)
+                return await agent_loop.run(
+                    self.messages,
+                    queued.message,
+                    system_prompt,
+                    max_turns,
+                    self,
+                    cancellation or Cancellation(),
+                    queued.run_id,
+                )
+            finally:
+                self._queue.task_done()
 
-    def _apply_projection(self, payload: EventPayload) -> None:
-        if isinstance(payload, UserMessageRecorded):
-            self._messages.append(payload.message)
-        elif isinstance(payload, AssistantMessageStarted):
-            self._drafts.add(payload.message_id)
-        elif isinstance(payload, AssistantMessageCompleted):
-            self._drafts.remove(payload.message.message_id)
-            self._messages.append(payload.message)
-        elif isinstance(payload, AssistantMessageDiscarded):
-            self._drafts.discard(payload.message_id)
-        elif isinstance(payload, ToolResultRecorded):
-            self._messages.append(payload.message)
+    async def commit_user(self, run_id: UUID, message: Message) -> None:
+        if message.role is not Role.USER:
+            raise EventCommitError("commit_user 只接受 user 消息")
+        await self._commit(
+            JournalRecordType.USER_MESSAGE,
+            run_id,
+            UserMessagePayload(message),
+            lambda: self._messages.append(message),
+            UserMessageCommitted(message=message),
+        )
 
-    def _validate_projection(self, payload: EventPayload) -> None:
-        if isinstance(payload, UserMessageRecorded):
-            if any(message.message_id == payload.message.message_id for message in self._messages):
-                raise EventCommitError("message_id 重复")
-        elif isinstance(payload, AssistantMessageStarted):
-            if payload.message_id in self._drafts or any(m.message_id == payload.message_id for m in self._messages):
-                raise EventCommitError("message_id 重复")
-        elif isinstance(payload, AssistantMessageCompleted):
-            if payload.message.message_id not in self._drafts:
-                raise EventCommitError("完成了未知的 Assistant 草稿")
-        elif isinstance(payload, ToolResultRecorded):
-            known_assistant_ids = {m.message_id for m in self._messages}
-            for part in payload.message.parts:
-                if part.assistant_message_id not in known_assistant_ids:  # type: ignore[attr-defined]
-                    raise EventCommitError("工具结果来源 AssistantMessage 不存在")
+    async def commit_assistant(
+        self,
+        run_id: UUID,
+        message: Message,
+        finish_reason: str | None,
+    ) -> None:
+        if message.role is not Role.ASSISTANT:
+            raise EventCommitError("commit_assistant 只接受 assistant 消息")
+        await self._commit(
+            JournalRecordType.ASSISTANT_MESSAGE,
+            run_id,
+            AssistantMessagePayload(message, finish_reason),
+            lambda: self._messages.append(message),
+            AssistantMessageCompleted(message=message, finish_reason=finish_reason),
+        )
 
-    async def recover_interrupted(self, run_id: UUID) -> tuple[UUID, ...]:
-        """只作废未完成草稿；未知工具绝不在恢复时执行。"""
-        if run_id in self._recovered_runs:
-            return ()
-        previous = self._active_run_id
-        self._active_run_id = run_id
-        discarded: list[UUID] = []
+    async def commit_tool_result(self, run_id: UUID, message: Message) -> None:
+        if message.role is not Role.TOOL:
+            raise EventCommitError("commit_tool_result 只接受 tool 消息")
+        await self._commit(
+            JournalRecordType.TOOL_RESULT,
+            run_id,
+            ToolResultPayload(message),
+            lambda: self._messages.append(message),
+            ToolResultCompleted(message=message),
+        )
+
+    async def commit_context_summary(self, run_id: UUID, summary: ContextSummary) -> None:
+        await self._commit(
+            JournalRecordType.CONTEXT_SUMMARY,
+            run_id,
+            ContextSummaryPayload(summary),
+            lambda: self._context_summaries.append(summary),
+            summary,
+        )
+
+    async def finish_run(self, run_id: UUID, result: AgentRunResult) -> None:
+        if result.error is not None:
+            safe = sanitize_error({
+                "category": result.error.category,
+                "type": "AgentRunError",
+                "message": result.error.message,
+            })
+            result = replace(
+                result,
+                error=ErrorInfo(str(safe["category"]), str(safe["message"])),
+            )
+        await self._commit(
+            JournalRecordType.RUN_TERMINATED,
+            run_id,
+            RunTerminatedPayload.from_result(result),
+            lambda: self._run_results.append(result),
+            RunTerminated(reason=result.reason.value, turn_count=result.turn_count),
+        )
+
+    async def _commit(self, record_type, run_id, payload, apply, update) -> None:
+        if self._failed:
+            raise EventCommitError("Session 已因 Journal 失败而必须重新打开")
+        record = JournalRecord(1, record_type, self.session_id, run_id, self._clock(), payload)
         try:
-            for message_id in tuple(self._drafts):
-                await self.emit(AssistantMessageDiscarded(message_id=message_id, reason="process_interrupted"))
-                discarded.append(message_id)
-            from .events import RunTerminated
-            await self.emit(RunTerminated(reason="PROCESS_INTERRUPTED", turn_count=0))
-            self._recovered_runs.add(run_id)
-        finally:
-            self._active_run_id = previous
-        return tuple(discarded)
+            await self._opened.append(record)
+        except Exception as exc:
+            self._failed = True
+            raise EventCommitError("Journal 提交失败，Session 必须重新打开") from exc
+        # 只有 fsync 返回后，内存 Transcript 和 UI 才能观察到新事实。
+        apply()
+        await self.publish_live(update)
 
-    def replay_after(self, sequence: int) -> tuple[SessionEvent, ...]:
-        return tuple(event for event in self._events if event.sequence > sequence)
+    async def publish_live(self, update: object) -> None:
+        if self._ui_sink is None:
+            return
+        try:
+            await self._ui_sink(update)
+        except Exception as exc:
+            self.ui_delivery_errors.append(exc)
+
+    async def recover_interrupted(self) -> AgentRunResult | None:
+        run_id = self._opened.recovered.interrupted_run
+        if run_id is None:
+            return None
+        assistants = [
+            record.payload.message
+            for record in self._opened.records
+            if record.run_id == run_id
+            and record.record_type is JournalRecordType.ASSISTANT_MESSAGE
+            and isinstance(record.payload, AssistantMessagePayload)
+        ]
+        result = AgentRunResult(
+            StopReason.PROCESS_INTERRUPTED,
+            len(assistants),
+            assistants[-1].message_id if assistants else None,
+        )
+        await self.finish_run(run_id, result)
+        return result
+
+    async def close(self) -> None:
+        await self._opened.close()

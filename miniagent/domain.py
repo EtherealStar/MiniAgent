@@ -140,6 +140,8 @@ class ToolExecutionBatch:
     run_id: UUID
     assistant_message_id: UUID
     tool_uses: tuple[ToolUsePart, ...]
+    trace_id: UUID | None = None
+    parent_span_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,3 +209,4 @@ def message_from_dict(data: Mapping[str, Any]) -> Message:
         continuation_of_message_id=UUID(data["continuation_of_message_id"]) if data.get("continuation_of_message_id") else None,
         retry_of_message_id=UUID(data["retry_of_message_id"]) if data.get("retry_of_message_id") else None,
     )
+
