@@ -145,15 +145,15 @@ SessionUpdate 允许丢失。第一版不检测事件缺口；明确打开或重
 │  ▸ Read 42 lines from miniagent/session.py           │
 │                                      ↓ new content   │
 ├──────────────────────────────────────────────────────┤
-│ cwd  ·  session title  ·  model                     │
+│ cwd  ·  session title  ·  model          ⠋ 运行中 │
 ├──────────────────────────────────────────────────────┤
 │ 多行输入框                                           │
 └──────────────────────────────────────────────────────┘
 ```
 
-状态栏只显示只读 cwd、Current Session 标题或空白状态、当前模型名称。它不展示内部 turn、token、ToolView 版本或 Journal 信息。
+状态栏左段显示只读 cwd、Current Session 标题或空白状态、当前模型名称；右段显示运行态——运行中（braille 字符 spinner）、`排队 n`、`✗ 出错`，无活动时留空。它不展示内部 turn、token、ToolView 版本或 Journal 信息。
 
-用户消息提交后立即显示；Assistant 第一个内容到达前不显示 spinner。
+用户消息提交后立即显示；消息区不显示 spinner，运行态由状态栏右段表达。
 
 ## 7. Textual 组件边界
 

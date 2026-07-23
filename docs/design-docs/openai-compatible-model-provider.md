@@ -14,7 +14,7 @@ MiniAgent 需要通过同一套内部接口调用不同的 OpenAI-compatible 模
 - 缺少配置时的可启动状态和调用失败语义；
 - OpenAI-compatible 模型列表查询；
 - OpenAI-compatible `POST /v1/chat/completions` 异步流式请求；
-- Model Context、ToolSpec 和生成选项到请求 JSON 的转换；
+- Model Context、ToolView 和生成选项到请求 JSON 的转换；
 - 文本、结构化 reasoning、工具调用增量、结束原因和 Token 用量的规范化；
 - HTTP、SSE、JSON、超时、取消和供应商错误边界；
 - HTTP 连接生命周期和无真实网络的测试策略。
@@ -111,7 +111,7 @@ class ModelAdapter(Protocol):
         self,
         model_id: str,
         context: ModelContext,
-        tools: tuple[ToolSpec, ...],
+        tools: ToolView,
         options: GenerationOptions,
         cancellation: Cancellation,
     ) -> AsyncIterator[ModelEvent]: ...
@@ -149,7 +149,7 @@ Accept: text/event-stream
 
 只有调用方提供 `temperature` 或 `max_tokens` 时才发送对应字段。首版不发送或处理多候选参数。
 
-没有工具时，不发送 `tools` 和 `tool_choice`。有工具时，将每个冻结的 `ToolSpec.function_schema` 转换为 OpenAI-compatible function tool，并默认发送 `"tool_choice": "auto"`；调用方可以覆盖为 `"none"` 或指定一个函数。不得发送空的 `tools: []`。
+没有可见工具时，不发送 `tools` 和 `tool_choice`。有工具时，只转换调用方传入的同一 ToolView 中的 function schemas，并默认发送 `"tool_choice": "auto"`；调用方可以覆盖为 `"none"` 或指定一个函数。不得发送空的 `tools: []`，也不得从静态 Registry 或另一份 ToolSpec 集合重新组装工具。这样 Provider schema 与 ContextManager 已注入的工具索引、Prompt 和 Recovery 保持一致。
 
 ### 5.3 模型列表
 

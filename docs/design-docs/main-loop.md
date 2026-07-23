@@ -99,8 +99,9 @@ Journal 写入失败时，步骤 3 和 4 不得执行。
 AgentLoop 只负责一次 AgentRun：
 
 - 接收固定 AgentRunEnvironment、只读历史和当前已提交 UserMessage；
-- 每次 ModelCall 前取得最新 ToolView；
+- 每次 ModelCall 前，由工具注册表视图结合当前 AgentRun 已提交的 ToolUse/ToolResult 重新投影最新 ToolView；
 - 请求 ContextManager 构建 Model Context；
+- 将同一个 ToolView 快照交给 ContextManager 和 ModelAdapter；
 - 消费规范化 ModelEvent 并组装内存 Assistant 草稿；
 - 完整响应到达后一次提交 AssistantMessage；
 - 执行已提交 AssistantMessage 中的 ToolUse；
@@ -161,6 +162,8 @@ Model Context
 
 ContextManager 可以裁剪 ToolResult、注入 memory 或用 ContextSummary 替代旧消息，但不能修改 Transcript。新摘要只有经 SessionEngine 提交为 ContextSummary Journal Record 后，才能进入后续 Working Context；覆盖边界由上下文设计文档定义。
 
+ToolView 不由 ContextManager 计算。AgentLoop 在每次 ModelCall 准备阶段，把冻结 Registry view 和当前 AgentRun 的已接受消息交给工具模块进行纯投影。投影只使用已经由 SessionEngine 提交的 ToolResultPart；尚未提交、提交失败或仅存在于 Trace 的结果不能改变工具可用性。
+
 ## 8. 主循环控制流程
 
 ```text
@@ -205,6 +208,8 @@ worker 取 QueuedInput
 只有完整 AssistantMessage 成功提交后，其中的 ToolUse 才能执行。若模型产生多个 ToolUse，它们形成一个 ToolExecutionBatch；AgentLoop 等待全部终态结果，再按模型调用顺序提交并继续。
 
 工具失败通常是模型可见 ToolResult，不是 AgentRun 致命错误。最后一个允许的 ModelCall 即使产生工具调用，也要完成并记录工具结果，然后以 `MAX_TURNS` 停止，不再调用模型总结。
+
+批次全部结果按原始 ToolUse 顺序提交后，下一次 ModelCall 才刷新 ToolView。同一工具在当前 AgentRun 中连续产生三次可计数的最终失败后，从下一次 ToolView 完全移除；成功结果清零该工具的连续失败。第一次或第二次失败只在紧接的一次 ModelCall 中产生不含失败次数的 Tool Recovery。该状态从当前 AgentRun 的已提交消息投影，不写入 AgentRunEnvironment，也不修改冻结 Registry。
 
 ### 8.2 流中断与重试
 
@@ -290,9 +295,10 @@ AgentRunResult
 7. 未完成或作废草稿不进入 Transcript 或 Model Context。
 8. ToolUse 所属 AssistantMessage 必须先提交，工具才能执行。
 9. turn_count 只随实际发出的 ModelCall 增加。
-10. AgentRunEnvironment 在整个 Run 内不变；每个 ModelCall 使用一致的最新 ToolView。
+10. AgentRunEnvironment 在整个 Run 内不变；每个 ModelCall 重新投影最新 ToolView，ContextManager 与 ModelAdapter 使用同一个快照。
 11. stop 会丢弃所有未持久化 QueuedInput。
 12. 恢复不自动重放模型或工具动作。
+13. 只有已经提交的 ToolResult 才能影响后续 Tool Recovery 和工具可用性。
 
 ## 13. 建议测试场景
 
@@ -302,6 +308,9 @@ AgentRunResult
 - 出队持久化失败时当前和后续 Run 都不启动；
 - 流式草稿可见但恢复后不存在；
 - 一个 AssistantMessage 含多个 ToolUse，结果乱序完成但顺序提交；
+- 同一批次的同名工具结果按原始 ToolUse 顺序影响下一轮 ToolView，不按完成顺序；
+- 第一次或第二次最终失败只影响紧接的一轮 Recovery，第三次连续失败从下一轮移除工具，成功清零；
+- ContextManager 与 ModelAdapter 接收同一个刷新后的 ToolView，schema 与 Prompt 不漂移；
 - 流中断后使用新 message_id 重试；
 - length 终态产生 continuation；
 - 取消活动 Run 不删除普通队列，stop 则丢弃全部队列；

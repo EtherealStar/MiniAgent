@@ -8,6 +8,7 @@
 
 - `docs/design-docs/main-loop.md`
 - `docs/design-docs/tool-registry-and-execution.md`
+- `docs/design-docs/tool-design-guidelines.md`
 - `docs/design-docs/openai-compatible-model-provider.md`
 - `docs/design-docs/context-management.md`
 - `docs/design-docs/persistence-and-observability.md`
@@ -36,6 +37,7 @@ worker 真正开始处理队首输入时，必须先将用户消息写入并 fsy
 - SessionRepository 拥有目录发现、Journal 读写和 writer lock；
 - AgentLoop 拥有一次 AgentRun 的控制状态；
 - ContextManager 拥有 system context 与 Model Context 的组装规则；
+- Tools 拥有冻结 Registry view 到每次 ModelCall 的动态 ToolView 投影规则；
 - RuntimeConfig 拥有当前模型与运行默认值。
 
 模型、工具、UI 和存储实现都不能绕过 SessionEngine 修改 Transcript。Textual App 可以编排应用生命周期，但不执行 AgentLoop，也不解释模型或工具协议。
@@ -44,7 +46,7 @@ worker 真正开始处理队首输入时，必须先将用户消息写入并 fsy
 
 队首用户消息持久化成功后，SessionEngine 收集已经组装好的固定值，形成不可变 AgentRunEnvironment。system context、model_id、生成选项和运行限制在整个 AgentRun 中保持不变；模型切换只影响尚未开始的排队输入。
 
-ToolView 是唯一按 ModelCall 动态组装的能力快照。AgentLoop 必须使用同一个 ToolView 构建 prompt、声明 schema 并执行 ToolUse。
+ToolView 是唯一按 ModelCall 动态组装的能力快照。它由工具模块根据冻结 Registry view 和当前 AgentRun 已提交的工具结果重新投影；连续最终失败可以改变后续 ModelCall 的工具可用性，但不修改 Registry。AgentLoop 必须使用同一个 ToolView 构建 Prompt、声明 schema 并执行 ToolUse。
 
 ### 2.5 可替换的外部边界
 
@@ -137,7 +139,7 @@ Model Provider 隔离认证、HTTP/SSE、请求转换和供应商错误。Runtim
 
 ### 3.7 Tools
 
-工具模块提供 ToolView，其中同时绑定可见 ToolSpec、schema、权限和执行能力。AgentLoop 不依赖具体工具实现。
+工具模块提供 ToolView，其中同时绑定可见 ToolSpec、schema、静态工具 Prompt、一次性 Tool Recovery、权限和执行能力。ToolView 只从冻结 Registry view 与当前 AgentRun 已提交的工具结果投影，不维护独立的失败计数事实。AgentLoop 不依赖具体工具实现，ContextManager 和 ModelAdapter 对同一次 ModelCall 消费同一个 ToolView 快照。
 
 ### 3.8 Persistence、SessionUpdate 与 Trace
 
@@ -221,6 +223,7 @@ Textual App 停止接收输入并调用 `SessionEngine.stop(APPLICATION_SHUTDOWN
 10. 恢复不得自动重放模型调用或可能有副作用的工具调用。
 11. 同一个 Session 同时只有一个进程持有 writer lock。
 12. SessionUpdate 和 Trace 都不参与业务恢复。
+13. 只有 Message Journal 已接受的工具结果能够改变后续 ToolView；Registry 不因单次 AgentRun 的失败而改变。
 
 ## 7. 验证场景
 
@@ -246,7 +249,7 @@ Textual App 停止接收输入并调用 `SessionEngine.stop(APPLICATION_SHUTDOWN
 - 当前 AssistantMessage 依赖 started/completed 草稿配对；目标是草稿仅存在内存，完成时一次提交。
 - JsonlTranscriptStore 当前没有恢复扫描、fsync、writer lock、目录列表和损坏隔离。
 - Textual App、SessionUpdate、按需历史列表和 Session 切换尚未实现。
-- AgentLoop 尚未接收 AgentRunEnvironment，也未在每次 ModelCall 前获取 ToolView。
+- AgentLoop 已开始在每次 ModelCall 前构造 ToolView，但 ToolView 仍由上下文模块定义，Provider 调用仍使用静态工具集合，尚未保证 Prompt、schema 和执行能力来自同一个动态快照。
 - 当前 ContextBuilder 尚未完整实现 ContextManager 的动态组装与压缩生命周期。
 
 这些差距表示后续实现工作，不否定已有代码和测试。
