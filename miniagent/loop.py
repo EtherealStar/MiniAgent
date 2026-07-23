@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from uuid import UUID, uuid4
 
 from .context import ContextBuilder, WorkingContext
+from .hooks import HookDispatcher, HookRegistry
+from .hooks.models import AssistantMessageCompletedContext, PostToolUseContext
 from .domain import (
     AgentRunResult,
     ErrorInfo,
@@ -51,6 +53,7 @@ class AgentLoop:
         context_budget: int = 16_000,
         text_processor_factory=PassthroughTextProcessor,
         trace_sink=None,
+        dispatcher: HookDispatcher | None = None,
     ) -> None:
         self._model = model
         self._context_builder = context_builder
@@ -62,6 +65,7 @@ class AgentLoop:
         self._trace_sink = trace_sink or NullTraceSink()
         self._provider_name = getattr(model, "provider_name", type(model).__name__)
         self._model_id = getattr(model, "model_id", None)
+        self._dispatcher = dispatcher or HookDispatcher(HookRegistry().freeze())
 
     async def run(
         self,
@@ -325,6 +329,11 @@ class AgentLoop:
                 for tool in (part for part in parts if isinstance(part, ToolUsePart)):
                     await committer.publish_live(ToolUseDetected(message_id=message_id, tool_use_id=tool.tool_use_id, name=tool.name, arguments=tool.arguments))
                 await committer.commit_assistant(actual_run_id, assistant, terminal.finish_reason)
+                await self._dispatcher.assistant_message_completed(
+                    AssistantMessageCompletedContext(
+                        run_id=actual_run_id, message=assistant, finish_reason=terminal.finish_reason
+                    )
+                )
                 working.append(assistant)
                 final_message_id = message_id
                 tool_uses = tuple(part for part in parts if isinstance(part, ToolUsePart))
@@ -357,6 +366,14 @@ class AgentLoop:
                             ),),
                         )
                         await committer.commit_tool_result(actual_run_id, tool_message)
+                        await self._dispatcher.after_tool_use(
+                            PostToolUseContext(
+                                run_id=actual_run_id,
+                                assistant_message_id=message_id,
+                                result=result,
+                                tool_message=tool_message,
+                            )
+                        )
                         working.append(tool_message)
                     if cancellation.cancelled:
                         await turn_span.finish(TraceStatus.CANCELLED)
@@ -407,4 +424,3 @@ class AgentLoop:
         if any(result.assistant_message_id != assistant_message_id for result in results):
             raise RuntimeError("ToolResult 的 assistant_message_id 不匹配")
         return tuple(by_id[tool.tool_use_id] for tool in tool_uses)
-

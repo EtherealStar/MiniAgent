@@ -33,6 +33,8 @@ class StopReason(StrEnum):
     PROCESS_INTERRUPTED = "PROCESS_INTERRUPTED"
     MODEL_UNAVAILABLE = "MODEL_UNAVAILABLE"
     EVENT_COMMIT_FAILED = "EVENT_COMMIT_FAILED"
+    HOOK_ABORTED = "HOOK_ABORTED"
+    HOOK_FAILED = "HOOK_FAILED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,4 +211,3 @@ def message_from_dict(data: Mapping[str, Any]) -> Message:
         continuation_of_message_id=UUID(data["continuation_of_message_id"]) if data.get("continuation_of_message_id") else None,
         retry_of_message_id=UUID(data["retry_of_message_id"]) if data.get("retry_of_message_id") else None,
     )
-
