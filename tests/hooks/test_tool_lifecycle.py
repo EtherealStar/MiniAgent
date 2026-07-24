@@ -18,7 +18,7 @@ from miniagent.ports import Cancellation, ModelContext
 from miniagent.provider.events import ResponseCompleted, TextDelta, ToolUseDelta
 from miniagent.session import EventCommitError
 from miniagent.tools.executor import ToolExecutor
-from miniagent.tools.models import ExecutionTraits, ToolSpec
+from miniagent.tools.models import ExecutionTraits, ToolOutput, ToolSpec
 from miniagent.tools.models import ToolProtocolError
 from miniagent.tools.registry import ToolRegistry
 
@@ -111,7 +111,7 @@ def make_runtime(tmp_path, timeline):
     async def handler(args, context):
         handler_calls.append(context.tool_use_id)
         timeline.append(f"handler:{context.tool_use_id}")
-        return args.value
+        return ToolOutput(content=args.value)
 
     spec = ToolSpec(
         "echo",

@@ -37,6 +37,7 @@ def build_function_schema(spec: ToolSpec) -> dict[str, object]:
         if result.get("type") == "object" or "properties" in result:
             properties = result.setdefault("properties", {})
             result["additionalProperties"] = False
+            # OpenAI strict schema 要求把默认字段也列入 required，由 Pydantic 负责默认值语义。
             result["required"] = list(properties)
         return result
 
@@ -47,7 +48,7 @@ def build_function_schema(spec: ToolSpec) -> dict[str, object]:
         "default": None,
         "description": "被本次调用修正的原始工具调用 ID；普通调用传 null。",
     }
-    parameters["required"] = list(properties)
+    parameters["required"] = list(parameters.get("required", [])) + ["correction_of_tool_use_id"]
     return {
         "type": "function",
         "function": {

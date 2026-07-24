@@ -4,10 +4,11 @@ import asyncio
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from miniagent.domain import ToolExecutionBatch, ToolResult, ToolUsePart
 from miniagent.ports import Cancellation
@@ -21,6 +22,7 @@ from miniagent.trace import (
 )
 
 from .artifacts import FileArtifactStore, MemoryTraceSink
+from .authorization import TargetAuthorizer
 from .models import (
     ExecutionContext,
     ExecutionTraits,
@@ -85,10 +87,13 @@ class ToolExecutor:
         *,
         artifact_store=None,
         trace_sink=None,
+        runtime_capabilities=None,
+        target_authorizer: TargetAuthorizer | None = None,
     ) -> None:
         self.registry = registry
         self.workspace_root = workspace_root.resolve(strict=True)
         self.session_id = session_id
+        self.runtime_capabilities = MappingProxyType(dict(runtime_capabilities or {}))
         self.artifact_store = artifact_store or FileArtifactStore(self.workspace_root)
         raw_trace_sink = trace_sink or MemoryTraceSink()
         self.trace_sink = (
@@ -97,6 +102,7 @@ class ToolExecutor:
             else BestEffortTraceSink(raw_trace_sink)
         )
         self._trace_recorder = TraceRecorder(self.trace_sink)
+        self.target_authorizer = target_authorizer or TargetAuthorizer(self.workspace_root)
         self._seen_ids: set[str] = set()
         self._correctable: dict[str, tuple[str, bool]] = {}
         self._correction_calls: set[str] = set()
@@ -125,6 +131,31 @@ class ToolExecutor:
             await self._prepare(use, batch, correction_eligible, position, outcomes[position])
             for position, use in enumerate(batch.tool_uses)
         ]
+        # 授权等待发生在任何 handler 启动之前，因此不消耗工具执行 timeout。
+        for item in prepared:
+            if item.result is not None or item.spec is None:
+                continue
+            try:
+                allowed = await self.target_authorizer.authorize(
+                    item.use.name, item.targets, str(batch.run_id), cancellation
+                )
+            except asyncio.CancelledError:
+                item.result = self._failure_result(
+                    item.use,
+                    batch,
+                    ToolFailure("cancelled", "target_authorization", "The permission request was cancelled."),
+                )
+                continue
+            if not allowed:
+                item.result = self._failure_result(
+                    item.use,
+                    batch,
+                    ToolFailure(
+                        "permission_denied",
+                        "target_authorization",
+                        "The tool call was not authorized.",
+                    ),
+                )
         for item in prepared:
             if item.result is not None and item.result.is_error:
                 await self._trace("call_started", item, attempt=0)
@@ -202,6 +233,16 @@ class ToolExecutor:
             return self._parameter_failure(item, batch, "malformed_arguments", "arguments 不是合法 JSON object")
         if not isinstance(raw, dict):
             return self._parameter_failure(item, batch, "malformed_arguments", "arguments 顶层必须是 object")
+        # 旧版 grep 调用仍可能省略新增的默认字段；在框架边界规范化，工具本身仍保持严格 schema。
+        if use.name == "grep":
+            raw.setdefault("mode", "regex")
+            raw.setdefault("exclude", [])
+            raw.setdefault("context_lines", 0)
+            raw.setdefault("include_ignored", False)
+            if raw.get("include") is None:
+                raw["include"] = []
+            elif isinstance(raw.get("include"), str):
+                raw["include"] = [raw["include"]]
         marker = raw.pop("correction_of_tool_use_id", ...)
         correction_failure = self._check_correction(use, marker, correction_eligible)
         if correction_failure:
@@ -216,13 +257,14 @@ class ToolExecutor:
                 preflight.field_errors,
             )
         # Executor 仍是最终真相边界；这里与默认 PreToolUse Hook 共用同一快筛逻辑。
-        fast = fast_validate_tool_use(use, spec)
-        if not fast.valid:
+        fast = fast_validate_tool_use(use, spec) if use.name != "grep" else None
+        if fast is not None and not fast.valid:
             return self._parameter_failure(item, batch, fast.code, fast.message, fast.field_errors)
         parameters = spec.function_schema["function"]["parameters"]
-        business_properties = set(parameters["properties"]) - {"correction_of_tool_use_id"}
-        missing = business_properties - set(raw)
-        extra = set(raw) - business_properties
+        required_properties = set(parameters.get("required", ())) - {"correction_of_tool_use_id"}
+        allowed_properties = set(parameters["properties"]) - {"correction_of_tool_use_id"}
+        missing = required_properties - set(raw)
+        extra = set(raw) - allowed_properties
         if marker is ...:
             missing.add("correction_of_tool_use_id")
         if missing or extra:
@@ -238,8 +280,16 @@ class ToolExecutor:
             return self._parameter_failure(item, batch, "invalid_arguments", "参数校验失败", errors, "pydantic_validation")
         try:
             item.targets = spec.resolve_targets(item.args, self.workspace_root)
-        except (TargetPolicyError, ToolExecutionError, OSError, ValueError) as exc:
-            item.result = self._failure_result(use, batch, ToolFailure("target_denied", "target_policy", str(exc)))
+        except TargetPolicyError as exc:
+            item.result = self._failure_result(use, batch, ToolFailure("target_denied", "target_policy", exc.safe_message))
+            return item
+        except ToolExecutionError as exc:
+            item.result = self._failure_result(use, batch, ToolFailure(exc.code.value, "target_policy", exc.safe_message))
+            return item
+        except (OSError, ValueError):
+            item.result = self._failure_result(
+                use, batch, ToolFailure("target_denied", "target_policy", "The target could not be resolved.")
+            )
             return item
         try:
             item.traits = spec.classify(item.args, item.targets)
@@ -291,21 +341,48 @@ class ToolExecutor:
                 trace_sink=self.trace_sink,
                 artifact_store=self.artifact_store,
                 targets=item.targets,
+                runtime_capabilities=self.runtime_capabilities,
             )
             try:
-                content = await self._run_handler(item, context, attempt_cancellation)
+                output = await self._run_handler(item, context, attempt_cancellation)
+                if not isinstance(output, item.spec.output_model):
+                    raise ToolProtocolError("handler 必须返回声明的 ToolOutput 模型")
+                try:
+                    output = item.spec.output_model.model_validate(output.model_dump(), strict=True)
+                except ValidationError as exc:
+                    raise ToolProtocolError("handler 返回的 ToolOutput 不符合声明 schema") from exc
+                content = output.content
+                output_data = output.model_dump(mode="json")
+                # 完整结构化输出参与预算；ArtifactStore 保存同一份规范 JSON。
+                encoded_output = json.dumps(output_data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                artifact_payload = encoded_output
                 artifact = None
                 visible = content
-                encoded = content.encode("utf-8")
-                if len(encoded) > item.spec.result_policy.threshold_bytes:
-                    artifact = self.artifact_store.persist(self.session_id, item.use.tool_use_id, content)
+                encoded = encoded_output.encode("utf-8")
+                policy = item.spec.result_policy
+                inline_limit = policy.max_inline_bytes or policy.hard_limit_bytes
+                if policy.overflow_behavior == "error" and (len(encoded) > inline_limit or len(encoded) > policy.hard_limit_bytes):
+                        return await self._execution_failure(
+                            item, batch, attempts, "resource_exhausted",
+                            "Result exceeds the inline budget; reduce the requested range.", False,
+                        )
+                if len(encoded) > policy.threshold_bytes:
+                    artifact = self.artifact_store.persist(self.session_id, item.use.tool_use_id, artifact_payload)
                     preview = encoded[: item.spec.result_policy.preview_bytes].decode("utf-8", errors="ignore")
                     visible = (
                         f"结果超过 {item.spec.result_policy.threshold_bytes} 字节，完整内容已外置。\n"
                         f"artifact: {artifact.path}\nbytes: {artifact.byte_count}\nsha256: {artifact.sha256}\n"
                         f"preview:\n{preview}"
                     )
-                result = ToolResult(item.use.tool_use_id, batch.assistant_message_id, visible, tool_name=item.use.name, attempts=attempts, artifact=artifact)
+                result = ToolResult(
+                    item.use.tool_use_id,
+                    batch.assistant_message_id,
+                    visible,
+                    tool_name=item.use.name,
+                    attempts=attempts,
+                    output=None if artifact is not None else output_data,
+                    artifact=artifact,
+                )
                 await self._trace("call_finished", item, attempt=attempts, status="success", result_bytes=len(encoded))
                 return result
             except asyncio.TimeoutError:
@@ -323,10 +400,14 @@ class ToolExecutor:
                         except asyncio.TimeoutError:
                             pass
                     continue
-                code = "outcome_unknown" if exc.outcome_unknown else "execution_failed"
-                return await self._execution_failure(item, batch, attempts, code, str(exc), exc.outcome_unknown, exc.transient)
-            except Exception as exc:
-                return await self._execution_failure(item, batch, attempts, "execution_failed", str(exc), False)
+                code = "outcome_unknown" if exc.outcome_unknown else exc.code.value
+                return await self._execution_failure(item, batch, attempts, code, exc.safe_message, exc.outcome_unknown, exc.transient)
+            except ToolProtocolError:
+                raise
+            except Exception:
+                return await self._execution_failure(
+                    item, batch, attempts, "operation_failed", "The tool could not complete the operation.", False
+                )
         raise AssertionError("重试循环必须返回终态")
 
     async def _run_handler(self, item, context, cancellation):
@@ -375,7 +456,17 @@ class ToolExecutor:
              "correctable": failure.correctable, "retryable": failure.retryable},
             ensure_ascii=False,
         )
-        return ToolResult(use.tool_use_id, batch.assistant_message_id, content, True, outcome_unknown, use.name, failure.code, attempts, failure)
+        return ToolResult(
+            use.tool_use_id,
+            batch.assistant_message_id,
+            content,
+            is_error=True,
+            outcome_unknown=outcome_unknown,
+            tool_name=use.name,
+            status=failure.code,
+            attempts=attempts,
+            failure=failure,
+        )
 
     async def _trace(self, event, item: _PreparedCall, **fields):
         assert item.trace_context is not None

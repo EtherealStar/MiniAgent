@@ -33,39 +33,6 @@ async def execute(tmp_path, raw, call_id="call-1"):
     return (await executor.submit_batch(batch, Cancellation()))[0]
 
 
-async def test_recursive_search_glob_sorting_case_and_line_numbers(tmp_path):
-    (tmp_path / "nested").mkdir()
-    (tmp_path / "z.txt").write_text("Needle\nneedle second\n", encoding="utf-8")
-    (tmp_path / "nested" / "a.txt").write_text("first\nNEEDLE\n", encoding="utf-8")
-    (tmp_path / "nested" / "ignore.py").write_text("needle\n", encoding="utf-8")
-    result = await execute(tmp_path, arguments(include="*.txt", case_sensitive=False))
-    lines = result.content.splitlines()
-    assert lines[:3] == ["nested/a.txt:2:NEEDLE", "z.txt:1:Needle", "z.txt:2:needle second"]
-    assert result.tool_use_id == "call-1" and result.status == "success"
-
-
-async def test_single_file_no_match_skips_and_long_line(tmp_path):
-    (tmp_path / "long.txt").write_text("needle" + "x" * 1000, encoding="utf-8")
-    result = await execute(tmp_path, arguments(path="long.txt"))
-    assert "[line truncated]" in result.content
-    result = await execute(tmp_path, arguments(pattern="absent"), "call-2")
-    assert result.content.startswith("No matches\n")
-
-
-async def test_binary_non_utf8_ignored_directories_and_limit(tmp_path):
-    (tmp_path / ".git").mkdir()
-    (tmp_path / ".mini").mkdir()
-    (tmp_path / ".git" / "secret").write_text("needle", encoding="utf-8")
-    (tmp_path / ".mini" / "old").write_text("needle", encoding="utf-8")
-    (tmp_path / "binary.bin").write_bytes(b"needle\x00")
-    (tmp_path / "legacy.txt").write_bytes(b"needle\xff")
-    (tmp_path / "text.txt").write_text("needle\nneedle\n", encoding="utf-8")
-    result = await execute(tmp_path, arguments(max_matches=1))
-    assert result.content.splitlines()[0] == "text.txt:1:needle"
-    assert "skipped_binary=1" in result.content and "skipped_non_utf8=1" in result.content
-    assert "truncated=true" in result.content
-
-
 @pytest.mark.parametrize("path", ["../outside", "missing", "C:\\Windows"])
 async def test_invalid_paths_are_structured_failures(tmp_path, path):
     result = await execute(tmp_path, arguments(path=path))

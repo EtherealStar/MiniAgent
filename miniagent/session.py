@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import UUID, uuid4
 
 from .domain import AgentRunResult, ContextSummary, ErrorInfo, Message, Role, StopReason
@@ -27,6 +29,9 @@ from .updates import (
     InputWithdrawn,
 )
 from .trace import sanitize_error
+from .documents import DocumentRef, DocumentRegistry
+from .tools.authorization import TargetAuthorizer
+from .tools.models import ToolTarget
 
 
 class EventCommitError(RuntimeError):
@@ -66,6 +71,9 @@ class SessionEngine:
         self._withdrawn_ids: set[UUID] = set()
         self._run_lock = asyncio.Lock()
         self.ui_delivery_errors: list[Exception] = []
+        self._document_registry: DocumentRegistry | None = None
+        self._target_authorizer: TargetAuthorizer | None = None
+        self._artifact_targets: set[ToolTarget] = set()
 
     @property
     def messages(self) -> tuple[Message, ...]:
@@ -166,9 +174,73 @@ class SessionEngine:
             JournalRecordType.TOOL_RESULT,
             run_id,
             ToolResultPayload(message),
-            lambda: self._messages.append(message),
+            lambda: self._accept_tool_result(message),
             ToolResultCompleted(message=message),
         )
+
+    def ensure_document_registry(self, workspace_root) -> DocumentRegistry:
+        if self._document_registry is None:
+            self._document_registry = DocumentRegistry(workspace_root, str(self.session_id))
+            for message in self._messages:
+                if message.role is Role.TOOL:
+                    self._register_controlled_refs(message)
+        return self._document_registry
+
+    def ensure_target_authorizer(self, workspace_root, *, enabled_external_reads, requester) -> TargetAuthorizer:
+        registry = self.ensure_document_registry(workspace_root)
+        if self._target_authorizer is None:
+            self._target_authorizer = TargetAuthorizer(
+                workspace_root,
+                enabled_external_reads=enabled_external_reads,
+                requester=requester,
+                controlled_read_targets=self.controlled_read_targets,
+            )
+        return self._target_authorizer
+
+    def controlled_read_targets(self) -> frozenset[ToolTarget]:
+        documents = self._document_registry.targets() if self._document_registry is not None else frozenset()
+        return documents | frozenset(self._artifact_targets)
+
+    def _accept_tool_result(self, message: Message) -> None:
+        self._messages.append(message)
+        self._register_controlled_refs(message)
+
+    def _register_controlled_refs(self, message: Message) -> None:
+        for part in message.parts:
+            if not part.is_error and part.artifact is not None:
+                self._register_artifact(part)
+            if (self._document_registry is not None and getattr(part, "tool_name", "") == "read_docs"
+                    and not part.is_error and part.output is not None):
+                try:
+                    raw = part.output["data"]["document"]
+                    ref = DocumentRef.model_validate(raw, strict=True)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                self._document_registry.register(ref)
+
+    def _register_artifact(self, part) -> None:
+        if self._document_registry is None:
+            return
+        try:
+            path_text = part.artifact["path"]
+            byte_count = part.artifact["byte_count"]
+            expected_hash = part.artifact["sha256"]
+            path = self._document_registry.workspace_root / path_text
+            expected = (
+                Path(".mini") / "sessions" / str(self.session_id)
+                / "tool_result" / part.tool_use_id / "result.json"
+            )
+            data = path.read_bytes()
+            path.resolve(strict=True).relative_to(self._document_registry.workspace_root)
+            valid = (
+                Path(path_text).as_posix() == expected.as_posix()
+                and type(byte_count) is int and len(data) == byte_count
+                and hashlib.sha256(data).hexdigest() == expected_hash
+            )
+        except (KeyError, TypeError, OSError):
+            valid = False
+        if valid:
+            self._artifact_targets.add(ToolTarget("file", "read", expected.as_posix()))
 
     async def commit_context_summary(self, run_id: UUID, summary: ContextSummary) -> None:
         await self._commit(

@@ -1,6 +1,7 @@
 from .models import (
     ArtifactRef,
     ExecutionContext,
+    ExecutionErrorCode,
     ExecutionTraits,
     FieldError,
     PreToolUseOutcome,
@@ -11,20 +12,20 @@ from .models import (
     ToolProtocolError,
     ToolSpec,
     ToolTarget,
+    ToolOutput,
 )
 from .registry import ToolRegistry, ToolRegistryView
 from .validation import FastValidationResult, fast_validate_tool_use
 
 
-def build_default_registry() -> ToolRegistry:
-    from .grep.grep import grep_spec
-
-    registry = ToolRegistry([grep_spec])
+def build_default_registry(*, external_tools: tuple[str, ...] = ()) -> ToolRegistry:
+    names = ("grep", "glob", "calculator", "read_file", "write_file", "todo_write") + external_tools
+    registry = ToolRegistry(available_names=names)
     registry.freeze()
     return registry
 
 __all__ = [
-    "ArtifactRef", "ExecutionContext", "ExecutionTraits", "FieldError", "ResultPolicy",
+    "ArtifactRef", "ExecutionContext", "ExecutionErrorCode", "ExecutionTraits", "FieldError", "ResultPolicy",
     "PreToolUseOutcome", "RetryPolicy", "ToolExecutionError", "ToolFailure", "ToolProtocolError", "ToolRegistry",
-    "ToolRegistryView", "ToolSpec", "ToolTarget", "build_default_registry", "FastValidationResult", "fast_validate_tool_use",
+    "ToolRegistryView", "ToolSpec", "ToolTarget", "ToolOutput", "build_default_registry", "FastValidationResult", "fast_validate_tool_use",
 ]

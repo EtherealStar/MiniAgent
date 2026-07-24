@@ -30,6 +30,43 @@ async def test_composer_hint_hides_while_typing(tmp_path):
         assert not hint.display
 
 
+async def test_composer_shell_has_one_input_and_only_a_top_border(tmp_path):
+    from miniagent.repository import SessionRepository
+
+    app = MiniAgentApp(repository=SessionRepository(tmp_path / "sessions"))
+    async with app.run_test(size=(80, 24)) as pilot:
+        for width, height in ((80, 24), (111, 39)):
+            await pilot.resize_terminal(width, height)
+            await pilot.pause()
+
+            composers = list(app.query(Composer))
+            assert len(composers) == 1
+            composer = composers[0]
+            composer_wrap = app.query_one("#composer-wrap")
+            hint = app.query_one("#composer-hint", Static)
+
+            assert composer_wrap.region.height == 5
+            assert composer.region == composer_wrap.region
+            assert composer.region.contains_region(hint.region)
+            assert composer_wrap.styles.background == app.screen.styles.background
+
+            app.set_focus(None)
+            await pilot.pause()
+            assert composer.styles.border_top[0] == "solid"
+            assert composer.styles.border_right[0] == ""
+            assert composer.styles.border_bottom[0] == ""
+            assert composer.styles.border_left[0] == ""
+            blurred_border_color = composer.styles.border_top[1]
+
+            composer.focus()
+            await pilot.pause()
+            assert composer.styles.border_top[0] == "solid"
+            assert composer.styles.border_right[0] == ""
+            assert composer.styles.border_bottom[0] == ""
+            assert composer.styles.border_left[0] == ""
+            assert composer.styles.border_top[1] != blurred_border_color
+
+
 async def test_status_bar_shows_run_state_and_stops_spinner(tmp_path):
     from miniagent.repository import SessionRepository
     from miniagent.ui.renderers.status import RunState

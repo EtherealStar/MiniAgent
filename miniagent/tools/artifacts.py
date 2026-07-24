@@ -21,7 +21,7 @@ class FileArtifactStore:
         digest = hashlib.sha256(data).hexdigest()
         directory = self.workspace_root / ".mini" / "sessions" / session_id / "tool_result" / tool_use_id
         directory.mkdir(parents=True, exist_ok=True)
-        result_path = directory / "result.txt"
+        result_path = directory / "result.json"
         metadata_path = directory / "metadata.json"
         if result_path.exists():
             existing = result_path.read_bytes()

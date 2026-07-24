@@ -1,0 +1,94 @@
+Screen {
+    layout: vertical;
+    background: $background;
+}
+
+#chat-wrap {
+    width: 100%;
+    height: 1fr;
+    background: $background;
+}
+
+#message-viewport {
+    width: 100%;
+    height: 100%;
+    background: $background;
+}
+
+.message {
+    padding: 0 1;
+    margin-bottom: 1;
+}
+
+/* Textual 没有 right/bottom 属性；MessageViewport 根据父容器尺寸设置 offset。 */
+#new-content {
+    display: none;
+    position: absolute;
+    width: auto;
+    height: 1;
+    padding: 0 1;
+    background: $panel;
+    color: $primary;
+}
+
+#status-bar {
+    width: 100%;
+    height: 1;
+    background: $surface;
+    padding: 0 1;
+}
+
+#status-left {
+    width: 1fr;
+}
+
+#status-right {
+    width: auto;
+}
+
+#composer-wrap {
+    width: 100%;
+    height: 5;
+    background: $background;
+    layers: editor placeholder;
+}
+
+#composer {
+    layer: editor;
+    width: 100%;
+    height: 5;
+    min-height: 3;
+    padding: 0 1;
+    border: none;
+    border-top: solid $panel;
+    background: $background;
+}
+
+#composer:focus {
+    border: none;
+    border-top: solid $primary;
+}
+
+#composer-hint {
+    layer: placeholder;
+    position: absolute;
+    offset: 2 1;
+    width: auto;
+    height: 1;
+    color: $text-muted;
+    background: $background;
+}
+
+#model-picker,
+#session-picker {
+    margin: 4 8;
+    padding: 1 2;
+    background: $surface;
+    border: solid $panel;
+}
+
+#model-picker Label,
+#session-picker Label {
+    text-style: bold;
+    margin-bottom: 1;
+}

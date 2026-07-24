@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import inspect
 import re
+import importlib
+from types import MappingProxyType
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Collection
 
 from pydantic import BaseModel
@@ -33,7 +35,18 @@ class ToolRegistryView:
 
 
 class ToolRegistry:
-    def __init__(self, specs: Collection[ToolSpec] = ()) -> None:
+    def __init__(self, specs: Collection[ToolSpec] = (), available_names: Collection[str] | None = None) -> None:
+        # 只按 composition root 明确列出的同名包加载，绝不扫描目录。
+        if available_names is not None:
+            loaded = []
+            for name in available_names:
+                module = importlib.import_module(f"miniagent.tools.{name}")
+                spec = getattr(module, "SPEC", None) or getattr(module, f"{name}_spec", None)
+                if spec is None:
+                    tool_module = importlib.import_module(f"miniagent.tools.{name}.tool")
+                    spec = getattr(tool_module, "SPEC", None) or getattr(tool_module, f"{name}_spec")
+                loaded.append(spec)
+            specs = tuple(loaded)
         self._pending = list(specs)
         self._view: ToolRegistryView | None = None
 
@@ -65,7 +78,24 @@ class ToolRegistry:
                 raise ToolRegistryError(f"工具 {spec.name} 的 input_model 必须设置 extra='forbid'")
             if not inspect.iscoroutinefunction(spec.handler):
                 raise ToolRegistryError(f"工具 {spec.name} 的 handler 必须是 async 函数")
-            frozen.append(spec.with_schema(build_function_schema(spec)))
+            if not isinstance(spec.output_model, type) or not issubclass(spec.output_model, BaseModel):
+                raise ToolRegistryError(f"工具 {spec.name} 的 output_model 必须是 Pydantic 模型")
+            if spec.output_model.model_config.get("extra") != "forbid":
+                raise ToolRegistryError(f"工具 {spec.name} 的 output_model 必须设置 extra='forbid'")
+            if spec.prompt_ref:
+                module_name, sep, symbol = spec.prompt_ref.partition(":")
+                if not sep:
+                    raise ToolRegistryError(f"工具 {spec.name} 的 PromptRef 无效")
+                try:
+                    prompt = getattr(importlib.import_module(module_name), symbol)
+                except (ImportError, AttributeError) as exc:
+                    raise ToolRegistryError(f"工具 {spec.name} 的 PromptRef 无法解析") from exc
+                if not isinstance(prompt, str) or not prompt.strip():
+                    raise ToolRegistryError(f"工具 {spec.name} 的 Prompt 不能为空")
+            schema = build_function_schema(spec)
+            output_schema = spec.output_model.model_json_schema(by_alias=True)
+            frozen.append(spec.with_schema(schema))
+            frozen[-1] = replace(frozen[-1], output_schema=MappingProxyType(output_schema))
         self._view = ToolRegistryView(tuple(frozen))
 
     def _require_view(self) -> ToolRegistryView:

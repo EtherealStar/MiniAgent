@@ -14,7 +14,7 @@ from miniagent.provider.events import ResponseCompleted, TextDelta, ToolUseDelta
 from miniagent.repository import SessionRepository
 from miniagent.session import SessionEngine
 from miniagent.tools.executor import ToolExecutor
-from miniagent.tools.models import ExecutionTraits, ToolSpec
+from miniagent.tools.models import ExecutionTraits, ToolOutput, ToolSpec
 from miniagent.tools.registry import ToolRegistry
 from miniagent.trace import MemoryTraceSink, TraceEventType
 
@@ -35,7 +35,7 @@ class Model:
 
 async def test_run_model_and_tool_spans_share_one_parent_tree_without_content(tmp_path):
     async def handler(args, context):
-        return "private-result"
+        return ToolOutput(content="private-result")
 
     spec = ToolSpec(
         "demo",

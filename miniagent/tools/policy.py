@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pathlib import Path, PurePath
+from pathlib import Path
 
 from .models import ToolExecutionError, ToolTarget
 
@@ -11,21 +11,44 @@ class TargetPolicyError(ToolExecutionError):
 
 def resolve_workspace_target(workspace_root: Path, raw_path: str) -> tuple[Path, ToolTarget]:
     root = workspace_root.resolve(strict=True)
-    candidate = Path(raw_path)
-    if candidate.is_absolute():
-        raise TargetPolicyError("path 必须是 workspace 内的相对路径")
-    if ".." in PurePath(raw_path).parts:
-        raise TargetPolicyError("path 不能包含父目录跳转 '..'")
+    candidate = Path(raw_path.strip())
+    if not raw_path.strip():
+        raise TargetPolicyError("path must not be empty")
     try:
-        resolved = (root / candidate).resolve(strict=True)
+        resolved = (candidate if candidate.is_absolute() else root / candidate).resolve(strict=True)
     except (FileNotFoundError, OSError) as exc:
-        raise TargetPolicyError(f"目标不存在或无法访问: {raw_path}") from exc
-    try:
-        relative = resolved.relative_to(root)
-    except ValueError as exc:
-        raise TargetPolicyError("目标解析后位于 workspace 外部") from exc
+        raise TargetPolicyError("target is unavailable") from exc
     if not resolved.is_file() and not resolved.is_dir():
         raise TargetPolicyError("目标必须是普通文件或目录")
     kind = "file" if resolved.is_file() else "directory"
-    value = relative.as_posix() or "."
-    return resolved, ToolTarget(kind=kind, operation="read", value=value)
+    return resolved, ToolTarget(kind=kind, capability="read", value=_target_value(root, resolved))
+
+
+def resolve_file_target(workspace_root: Path, raw_path: str, *, operation: str) -> tuple[Path, ToolTarget]:
+    """解析文件目标；写入允许目标尚不存在，但父目录必须存在。"""
+    root = workspace_root.resolve(strict=True)
+    if not raw_path.strip():
+        raise TargetPolicyError("path must not be empty")
+    candidate = Path(raw_path.strip())
+    destination = candidate if candidate.is_absolute() else root / candidate
+    try:
+        resolved = destination.resolve(strict=False)
+    except OSError as exc:
+        raise TargetPolicyError("target is unavailable") from exc
+    if operation == "read":
+        if not resolved.exists():
+            raise TargetPolicyError("target is unavailable")
+        if not resolved.is_file():
+            raise TargetPolicyError("target must be a regular file")
+    else:
+        parent = resolved.parent
+        if not parent.exists() or not parent.is_dir():
+            raise TargetPolicyError("parent directory is unavailable")
+    return resolved, ToolTarget(kind="file", capability=operation, value=_target_value(root, resolved))
+
+
+def _target_value(root: Path, resolved: Path) -> str:
+    try:
+        return resolved.relative_to(root).as_posix() or "."
+    except ValueError:
+        return resolved.as_posix()

@@ -39,6 +39,7 @@ from .domain import (
     ToolSpec,
     ToolUsePart,
 )
+from dataclasses import asdict
 from .updates import (
     AssistantMessageDiscarded,
     AssistantMessageStarted,
@@ -556,6 +557,10 @@ class AgentLoop:
                                 content=result.content,
                                 is_error=result.is_error,
                                 outcome_unknown=result.outcome_unknown,
+                                tool_name=result.tool_name,
+                                output=result.output,
+                                failure=asdict(result.failure) if result.failure is not None else None,
+                                artifact=asdict(result.artifact) if result.artifact is not None else None,
                             ),),
                         )
                         await committer.commit_tool_result(actual_run_id, tool_message)

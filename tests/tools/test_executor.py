@@ -20,6 +20,7 @@ from miniagent.tools.models import (
     ToolExecutionError,
     ToolProtocolError,
     ToolSpec,
+    ToolOutput,
 )
 from miniagent.tools.registry import ToolRegistry
 from miniagent.trace import TraceEventType
@@ -31,8 +32,11 @@ class Input(BaseModel):
 
 
 def make_spec(name, handler, *, safe=True, attempts=1, threshold=50 * 1024):
+    async def structured_handler(args, context):
+        value = await handler(args, context)
+        return value if isinstance(value, ToolOutput) else ToolOutput(content=value)
     return ToolSpec(
-        name, Input, handler,
+        name, Input, structured_handler,
         classify=lambda args, targets: ExecutionTraits(safe),
         retry_policy=RetryPolicy(attempts),
         result_policy=ResultPolicy(threshold_bytes=threshold, hard_limit_bytes=50 * 1024),
@@ -224,7 +228,8 @@ async def test_timeout_cancellation_and_large_result(tmp_path):
     results = await subject.submit_batch(batch(call("timed", "t"), call("large", "l")), Cancellation())
     assert results[0].failure.code == "timeout"
     assert results[1].artifact is not None
-    assert (tmp_path / results[1].artifact.path).read_text() == "x" * 101
+    persisted = json.loads((tmp_path / results[1].artifact.path).read_text())
+    assert persisted["content"] == "x" * 101
 
     cancelled = Cancellation(); cancelled.cancel()
     cancelled_trace = MemoryTraceSink()

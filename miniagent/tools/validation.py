@@ -27,7 +27,8 @@ def fast_validate_tool_use(use: ToolUsePart, spec: ToolSpec | None) -> FastValid
     marker = raw.pop("correction_of_tool_use_id", ...)
     parameters = spec.function_schema or {}
     properties = set(parameters.get("function", {}).get("parameters", {}).get("properties", {}))
-    business = properties - {"correction_of_tool_use_id"}
+    required = set(parameters.get("function", {}).get("parameters", {}).get("required", []))
+    business = required - {"correction_of_tool_use_id"}
     missing = business - set(raw)
     extra = set(raw) - business
     if marker is ...:

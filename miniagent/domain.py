@@ -70,11 +70,26 @@ class ToolResultPart:
     content: str
     is_error: bool = False
     outcome_unknown: bool = False
+    tool_name: str = ""
+    output: Mapping[str, Any] | None = None
+    failure: Mapping[str, Any] | None = None
+    artifact: Mapping[str, Any] | None = None
     part_id: UUID = field(default_factory=uuid4)
 
     def __post_init__(self) -> None:
         if not self.tool_use_id:
             raise ValueError("工具结果必须关联 tool_use_id")
+        # 旧版 Journal 只有 content/is_error；读取时补成新结构，保持恢复兼容。
+        if self.output is None and self.failure is None and self.artifact is None:
+            if self.is_error:
+                object.__setattr__(self, "failure", {"code": "operation_failed", "stage": "execution", "message": self.content})
+            else:
+                object.__setattr__(self, "output", {"content": self.content})
+        representations = sum(value is not None for value in (self.output, self.failure, self.artifact))
+        if self.is_error and (self.failure is None or representations != 1):
+            raise ValueError("失败工具结果必须且只能包含 failure")
+        if not self.is_error and representations != 1:
+            raise ValueError("成功工具结果必须且只能包含 output 或 artifact")
 
 
 Part: TypeAlias = TextPart | ReasoningPart | ToolUsePart | ToolResultPart
@@ -160,6 +175,7 @@ class ToolResult:
     tool_name: str = ""
     status: str = "success"
     attempts: int = 1
+    output: Mapping[str, Any] | None = None
     failure: Any | None = None
     artifact: Any | None = None
 
@@ -179,6 +195,10 @@ def part_to_dict(part: Part) -> dict[str, Any]:
             content=part.content,
             is_error=part.is_error,
             outcome_unknown=part.outcome_unknown,
+            tool_name=part.tool_name,
+            output=dict(part.output) if part.output is not None else None,
+            failure=dict(part.failure) if part.failure is not None else None,
+            artifact=dict(part.artifact) if part.artifact is not None else None,
         )
     return data
 
@@ -205,7 +225,12 @@ def message_from_dict(data: Mapping[str, Any]) -> Message:
         elif kind == "ToolUsePart":
             parts.append(ToolUsePart(name=raw["name"], arguments=raw["arguments"], tool_use_id=raw["tool_use_id"], **common))
         elif kind == "ToolResultPart":
-            parts.append(ToolResultPart(tool_use_id=raw["tool_use_id"], assistant_message_id=UUID(raw["assistant_message_id"]), content=raw["content"], is_error=raw["is_error"], outcome_unknown=raw["outcome_unknown"], **common))
+            parts.append(ToolResultPart(
+                tool_use_id=raw["tool_use_id"], assistant_message_id=UUID(raw["assistant_message_id"]),
+                content=raw["content"], is_error=raw["is_error"], outcome_unknown=raw["outcome_unknown"],
+                tool_name=raw.get("tool_name", ""), output=raw.get("output"),
+                failure=raw.get("failure"), artifact=raw.get("artifact"), **common,
+            ))
         else:
             raise ValueError(f"未知 Part 类型: {kind}")
     return Message(

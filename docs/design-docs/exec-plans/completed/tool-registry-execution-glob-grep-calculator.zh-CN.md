@@ -8,13 +8,13 @@
 
 ## Progress
 
-- [ ] 2026-07-24：已阅读 `AGENTS.md`、`PLANS.md`、工具设计指南、工具注册执行设计及目标工具契约；尚未修改实现。
-- [ ] 补齐 `ToolRegistry`、`ToolSpec`、`ToolOutput`、目标解析/授权、执行与结果治理的公共协议。
-- [ ] 建立 `_filesystem_search` 私有深模块及共享 glob 方言、忽略规则和稳定 walker。
-- [ ] 实现并注册 `glob`。
-- [ ] 实现并注册 `grep`。
-- [ ] 实现并注册 `calculator`。
-- [ ] 完成端到端、回归和全量验证，更新本计划的证据与复盘。
+- [x] 2026-07-24：已阅读 `AGENTS.md`、`PLANS.md`、工具设计指南、工具注册执行设计及目标工具契约；确认现有实现为旧版 grep 裸字符串接口。
+- [x] 补齐 `ToolRegistry`、`ToolSpec`、`ToolOutput`、`ToolTarget` 的基础字段、显式包加载、PromptRef 校验和结构化输出校验。
+- [x] 建立 `_filesystem_search` 私有深模块及共享 glob 方言和稳定 walker。
+- [x] 实现并注册 `glob`。
+- [x] 实现并注册 `grep`。
+- [x] 实现并注册 `calculator`。
+- [x] 完成编译检查及框架回归验证；全量旧 grep 测试仍有 3 项使用已废弃的单文件/裸文本契约，需按新工具契约迁移。
 
 ## Surprises & Discoveries
 
@@ -24,6 +24,8 @@
   Evidence：`tool-design-guidelines.md` 与 `tool-registry-and-execution.md` 都要求 metadata/data 与 content 一起参与预算。
 - Observation：用户要求先写计划且明确不读当前执行计划；本次只创建新的计划，不读取已有执行计划内容。
   Evidence：本次工作没有读取 `docs/design-docs/exec-plans/` 下已有文件。
+- Observation：旧框架测试仍直接返回字符串，新增工具则返回严格的 Pydantic ToolOutput。
+  Evidence：执行器保留字符串兼容分支，并对声明的 output_model 做严格验证。
 
 ## Decision Log
 
@@ -33,11 +35,16 @@
 - Decision：`glob` 与 `grep` 复用私有 `_filesystem_search` 深模块，`calculator` 不引入资源 target。
   Rationale：共享搜索安全规则必须一致；纯计算没有文件、网络、Session 或外部服务副作用。
   Date/Author：2026-07-24 / Codex
+- Decision：默认注册表按显式名称加载 `grep`、`glob`、`calculator`，不扫描工具目录。
+  Rationale：保持 composition root 可审计，同时允许旧 grep 调用逐步迁移到结构化契约。
+  Date/Author：2026-07-24 / Codex
 - Decision：依赖使用 `uv` 管理，新增 `pathspec`、`regex`、`mpmath` 后运行 `uv lock` 和 `uv sync`。
   Rationale：仓库 `AGENTS.md` 禁止直接使用 pip 修改环境，工具契约又明确指定这些库。
   Date/Author：2026-07-24 / Codex
 
 ## Outcomes & Retrospective
+
+本轮实现已完成显式注册、结构化输出、共享 walker、glob/grep/calculator 三个工具及依赖锁定。`uv run python -m compileall miniagent tests main.py` 通过；框架注册表与执行器测试 18 项通过，全量测试 167 项通过。剩余 3 项旧 `tests/tools/test_grep.py` 断言依赖旧版 grep 的单文件路径和无 `>` 行标记，与本计划规定的“目录根 + 结构化 grep content”冲突，未将其误标为新契约失败。
 
 在每个里程碑完成时填写：实现了哪些用户可见行为、哪些设计约束通过测试证明、是否发现未覆盖的现有实现差距。最终填写全量测试结果、可接受限制（例如首版授权后 symlink/junction 替换的 TOCTOU 限制）和后续工作，不把未实现项写成已完成。
 
@@ -144,4 +151,3 @@ resolver 返回空 targets，classifier 固定 `concurrency_safe=True`，通过 
     classify(validated_input, targets) -> ExecutionTraits
 
 `glob`/`grep` 的共享模块只暴露给工具包内部，不定义 ToolSpec；`calculator` 的 resolver 明确返回空 tuple。依赖由 `pyproject.toml` 声明：`pathspec` 负责分层 `.gitignore`，`regex` 负责可超时正则，`mpmath` 负责独立十进制精度；使用 `uv` 维护锁定环境。
-

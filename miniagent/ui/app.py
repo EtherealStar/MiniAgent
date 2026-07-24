@@ -18,17 +18,23 @@ from ..provider.openai import OpenAICompatibleModelAdapter
 from ..context import ContextManager, PromptInputs
 from ..hooks import FastToolValidationHook, HookDispatcher, HookRegistry
 from ..tools import build_default_registry
+from ..documents import DocumentCache
+from ..tools.authorization import PermissionDecision, PermissionRequest
+from ..tools.config import ExternalToolConfigLoader
 from ..tools.executor import ToolExecutor
+from ..tools.read_docs.client import MinerUClient
+from ..tools.todo_write.tool import TodoStore
 from ..repository import SessionRepository
 from ..ui.projection import MessageLifecycle, UiProjection
 from .commands import CommandName, parse_command
 from .composer import Composer
 from .modals.model_picker import ModelPickerModal
 from .modals.session_picker import SessionPickerModal
+from .modals.permission import PermissionModal
 from .renderers.status import RunState
 from .session_facade import RuntimeSession
 from .status_bar import StatusBar
-from .theme import MINIAGENT_THEME, apply_theme
+from .theme import apply_theme
 from .viewport import MessageViewport, NewContentButton
 from .runtime import RuntimeConfigStore
 
@@ -41,19 +47,47 @@ class _UnavailableLoop:
 
 
 class _ConfiguredLoop:
-    def __init__(self, configuration) -> None:
+    def __init__(self, configuration, tool_configuration, permission_requester, todo_store) -> None:
         self.configuration = configuration
+        self.tool_configuration = tool_configuration
+        self.permission_requester = permission_requester
+        self.todo_store = todo_store
 
     async def run(self, initial_messages, user_message, system_prompt, max_turns, committer, cancellation, run_id):
         from ..loop import AgentLoop
 
-        registry = build_default_registry()
+        external_names = []
+        capabilities = {"todo_store": self.todo_store}
+        enabled_reads = set()
+        mineru_client = None
+        tavily_client = None
+        if self.tool_configuration.tavily_api_key:
+            from tavily import AsyncTavilyClient
+            tavily_client = AsyncTavilyClient(api_key=self.tool_configuration.tavily_api_key)
+            capabilities["tavily_client"] = tavily_client
+            external_names.append("web_search")
+            enabled_reads.add("api.tavily.com")
+        if self.tool_configuration.mineru_api_token:
+            mineru_client = MinerUClient(self.tool_configuration.mineru_api_token)
+            capabilities["mineru_client"] = mineru_client
+            external_names.append("read_docs")
+        registry = build_default_registry(external_tools=tuple(external_names))
         hook_registry = HookRegistry()
         hook_registry.register_pre_tool_use(FastToolValidationHook())
         dispatcher = HookDispatcher(hook_registry.freeze())
         model = OpenAICompatibleModelAdapter(self.configuration)
-        executor = ToolExecutor(registry.enabled_view(), Path.cwd(), str(committer.session_id))
         workspace = Path.cwd()
+        document_registry = committer.ensure_document_registry(workspace)
+        capabilities["document_cache"] = DocumentCache(workspace, document_registry)
+        authorizer = committer.ensure_target_authorizer(
+            workspace,
+            enabled_external_reads=enabled_reads,
+            requester=self.permission_requester,
+        )
+        executor = ToolExecutor(
+            registry.enabled_view(), workspace, str(committer.session_id),
+            runtime_capabilities=capabilities, target_authorizer=authorizer,
+        )
         agents_path = workspace / "AGENTS.md"
         try:
             agents_md = agents_path.read_text(encoding="utf-8") if agents_path.is_file() else ""
@@ -77,59 +111,17 @@ class _ConfiguredLoop:
                 dispatcher=dispatcher,
             ).run(initial_messages, user_message, prompt_inputs, max_turns, committer, cancellation, run_id)
         finally:
-            await model.close()
+            closers = [model.close()]
+            if mineru_client is not None:
+                closers.append(mineru_client.close())
+            if tavily_client is not None:
+                closers.append(tavily_client.close())
+            await asyncio.gather(*closers, return_exceptions=True)
 
 
 class MiniAgentApp(App[None]):
     TITLE = "MiniAgent"
-    CSS = """
-    Screen { background: $background; }
-
-    #chat-wrap { height: 1fr; }
-    #message-viewport { background: $background; }
-    .message { padding: 0 1; margin-bottom: 1; }
-    /* Textual 没有 right/bottom 属性：绝对定位以父容器左上角为原点，
-       具体偏移由 MessageViewport 按尺寸换算（距右 2、距底 1）。 */
-    #new-content {
-        display: none;
-        position: absolute;
-        width: auto;
-        height: 1;
-        padding: 0 1;
-        background: $surface-2;
-        color: $primary;
-    }
-
-    #status-bar { height: 1; background: $surface; padding: 0 1; }
-    #status-left { width: 1fr; }
-    #status-right { width: auto; }
-
-    #composer-wrap { height: auto; }
-    #composer {
-        height: 5;
-        min-height: 3;
-        padding: 0 1;
-        border-top: solid $surface-2;
-        background: $background;
-    }
-    #composer:focus { border-top: solid $primary; }
-    #composer-hint {
-        position: absolute;
-        offset: 1 1;
-        width: auto;
-        height: 1;
-        color: $muted;
-        background: $background;
-    }
-
-    #model-picker, #session-picker {
-        margin: 4 8;
-        padding: 1 2;
-        background: $surface;
-        border: solid $surface-2;
-    }
-    #model-picker Label, #session-picker Label { text-style: bold; margin-bottom: 1; }
-    """
+    CSS_PATH = "miniagent.tcss"
     BINDINGS = [Binding("ctrl+c", "cancel_or_quit", "取消/退出", show=True)]
 
     def __init__(
@@ -139,17 +131,12 @@ class MiniAgentApp(App[None]):
         loop_factory: Callable[[], object] | None = None,
     ) -> None:
         super().__init__()
-        # App.__init__ 会用默认主题快照一份 CSS 变量，而 $surface-2 等自定义变量只
-        # 存在于 MiniAgent 主题；这里注册主题、预设当前主题（set_reactive 跳过尚未
-        # 运行时的 watcher），并用新主题的变量重建样式表，使启动解析即可命中。
-        self.register_theme(MINIAGENT_THEME)
-        self.set_reactive(App.theme, MINIAGENT_THEME.name)
-        self.stylesheet.set_variables(self.get_css_variables())
         self.repository = repository or SessionRepository(Path(".miniagent") / "sessions")
         self.projection = UiProjection()
         self.current: RuntimeSession | None = None
         self._loop_factory = loop_factory or self._default_loop_factory
         self.config = RuntimeConfigStore()
+        self._todo_store = TodoStore()
         self._transition_lock = asyncio.Lock()
         self._last_ctrl_c = 0.0
 
@@ -310,4 +297,18 @@ class MiniAgentApp(App[None]):
             return _UnavailableLoop()
         selected = self.config.get().model
         configuration = replace(loaded.configuration, model=selected) if selected else loaded.configuration
-        return _ConfiguredLoop(configuration)
+        tool_configuration = ExternalToolConfigLoader().load(os.environ, Path(".env"))
+        return _ConfiguredLoop(
+            configuration, tool_configuration, self._request_permission, self._todo_store
+        )
+
+    async def _request_permission(self, request: PermissionRequest, cancellation) -> PermissionDecision:
+        if cancellation.cancelled:
+            raise asyncio.CancelledError
+        modal = PermissionModal(request)
+        try:
+            return await self.push_screen_wait(modal)
+        except asyncio.CancelledError:
+            if self.screen is modal:
+                self.pop_screen()
+            raise

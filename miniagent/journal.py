@@ -364,6 +364,12 @@ def _object(value: object, label: str) -> Mapping[str, Any]:
     return value
 
 
+def _optional_mapping(value: object, label: str) -> Mapping[str, Any] | None:
+    if value is None:
+        return None
+    return dict(_object(value, label))
+
+
 def _exact_fields(value: Mapping[str, Any], expected: set[str], label: str) -> None:
     actual = set(value)
     unknown = actual - expected
@@ -448,11 +454,10 @@ def _part(raw: object):
                 **common,
             )
         if kind == "ToolResultPart":
-            _exact_fields(
-                value,
-                {"type", "part_id", "tool_use_id", "assistant_message_id", "content", "is_error", "outcome_unknown"},
-                "ToolResultPart",
-            )
+            legacy_fields = {"type", "part_id", "tool_use_id", "assistant_message_id", "content", "is_error", "outcome_unknown"}
+            structured_fields = legacy_fields | {"tool_name", "output", "failure", "artifact"}
+            if set(value) not in {frozenset(legacy_fields), frozenset(structured_fields)}:
+                raise JournalCorruptionError("ToolResultPart 字段集合无效")
             is_error = value["is_error"]
             outcome_unknown = value["outcome_unknown"]
             if type(is_error) is not bool or type(outcome_unknown) is not bool:
@@ -463,6 +468,10 @@ def _part(raw: object):
                 _string(value["content"], "content"),
                 is_error,
                 outcome_unknown,
+                _string(value.get("tool_name", ""), "tool_name"),
+                _optional_mapping(value.get("output"), "output"),
+                _optional_mapping(value.get("failure"), "failure"),
+                _optional_mapping(value.get("artifact"), "artifact"),
                 **common,
             )
     except ValueError as exc:
