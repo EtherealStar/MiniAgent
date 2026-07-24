@@ -339,7 +339,7 @@ uv run python -m pytest -q
 5. **模型发现与持久化选择**：当前 Model picker 只展示已知模型名，Adapter 没有完整接入按需 `/v1/models`，RuntimeConfig 的模型切换也未原子回写 `.env`。
 6. **Session 停止语义**：当前 RuntimeSession 主要通过取消 worker 和关闭 handle 完成停止；目标契约要求区分 Session 切换、应用关闭等停止原因，并尽力提交明确 Run 终态、发布队列丢弃和 SessionStopped 更新。
 7. **虚拟滚动精度**：当前 UI 已限制屏幕外 widget 的创建，但每次刷新重建估算索引；目标设计要求持久维护真实高度、滚动锚点、resize 修正和“返回底部”状态。
-8. **默认工具集**：工具框架已具备 Registry、schema、执行与 Artifact 能力，但默认只注册 `grep`；设计中引用的通用 `read_file(offset, limit)` 尚未成为默认能力。
+8. **默认工具集**：工具框架已具备 Registry、schema、执行与 Artifact 能力，但默认只注册 `grep`；`read_file`、`write_file`、`read_docs` 和 `todo_write` 已有稳定设计契约，尚未实现或成为默认能力。
 
 这些差距不改变第 3～6 节的不变量；后续实现应沿既有边界补齐，而不是让 UI、Provider 或 ToolExecutor 绕过 SessionEngine。
 
@@ -350,6 +350,8 @@ uv run python -m pytest -q
 - [`context-management.md`](design-docs/context-management.md)：Model Context、Token 预算和摘要压缩
 - [`openai-compatible-model-provider.md`](design-docs/openai-compatible-model-provider.md)：Provider 配置、HTTP/SSE 与错误语义
 - [`tool-registry-and-execution.md`](design-docs/tool-registry-and-execution.md)：工具注册、校验、策略、执行和 Artifact
+- [`tool-design-guidelines.md`](design-docs/tool-design-guidelines.md)：内置工具作者约定与具体工具设计索引
+- [`tools/`](design-docs/tools/README.md)：glob、grep、calculator 与 web_search 的稳定契约
 - [`hook-registry-and-lifecycle.md`](design-docs/hook-registry-and-lifecycle.md)：Hook 生命周期与异常语义
 - [`persistence-and-observability.md`](design-docs/persistence-and-observability.md)：Journal、恢复、writer lock 和 Trace
 - [`textual-ui.md`](design-docs/textual-ui.md)：Textual 生命周期、投影、虚拟滚动和交互

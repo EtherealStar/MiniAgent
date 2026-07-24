@@ -9,6 +9,7 @@
 - `docs/design-docs/main-loop.md`
 - `docs/design-docs/tool-registry-and-execution.md`
 - `docs/design-docs/tool-design-guidelines.md`
+- `docs/design-docs/tools/README.md`
 - `docs/design-docs/openai-compatible-model-provider.md`
 - `docs/design-docs/context-management.md`
 - `docs/design-docs/persistence-and-observability.md`
@@ -39,6 +40,8 @@ worker 真正开始处理队首输入时，必须先将用户消息写入并 fsy
 - ContextManager 拥有 system context 与 Model Context 的组装规则；
 - Tools 拥有冻结 Registry view 到每次 ModelCall 的动态 ToolView 投影规则；
 - SessionEngine 内的 PermissionManager 拥有 pending Permission Request、当前 AgentRun 拒绝缓存和 Session Permission Grant；
+- composition root 创建的 TodoStore 拥有按 Session identity 隔离的进程内 TodoList；
+- DocumentCache 拥有 Current Session 已完成的文档 Markdown 与 DocumentRef 登记；
 - RuntimeConfig 拥有当前模型与运行默认值。
 
 模型、工具、UI 和存储实现都不能绕过 SessionEngine 修改 Transcript。Textual App 可以编排应用生命周期，但不执行 AgentLoop，也不解释模型或工具协议。
@@ -48,6 +51,8 @@ worker 真正开始处理队首输入时，必须先将用户消息写入并 fsy
 Current Session 创建或打开时冻结 Workspace Root，直到对应 SessionEngine 停止都不随进程 cwd 变化。队首用户消息持久化成功后，SessionEngine 收集已经组装好的固定值，形成不可变 AgentRunEnvironment。system context、model_id、生成选项和运行限制在整个 AgentRun 中保持不变；模型切换只影响尚未开始的排队输入。
 
 ToolView 是唯一按 ModelCall 动态组装的模型可见工具快照。它由工具模块根据冻结 Registry view 和当前 AgentRun 已提交的工具结果重新投影；连续最终失败可以改变后续 ModelCall 的工具可用性，但不修改 Registry。AgentLoop 必须使用同一个 ToolView 构建 Prompt、声明 schema 并执行 ToolUse。交互式 permission 在 ToolUse 目标解析后发生，不属于 ToolView，也不改变在途 ModelCall 的快照。
+
+TodoReminder 是独立的可选 AgentRun 动态状态投影，不属于 ToolView。AgentLoop 只在连续十次 ModelCall 未成功提交 `todo_write` 且 Current Session TodoList 仍有未完成事项时构造；ContextManager 只格式化该快照。TodoStore 不属于 Transcript 或 AgentRunEnvironment。
 
 ### 2.5 可替换的外部边界
 
@@ -88,7 +93,7 @@ flowchart TD
 
 ### 3.1 Textual App
 
-Textual App 是唯一应用入口。它直接组合 SessionRepository、SessionEngine、RuntimeConfig 和 Model Provider，并负责：
+Textual App 是唯一应用入口。它直接组合 SessionRepository、SessionEngine、RuntimeConfig、TodoStore 和 Model Provider，并负责：
 
 - 保持零个或一个 Current Session；
 - 首条消息创建 Session；
@@ -142,7 +147,7 @@ Model Provider 隔离认证、HTTP/SSE、请求转换和供应商错误。Runtim
 
 ### 3.7 Tools
 
-工具模块提供 ToolView，其中同时绑定可见 ToolSpec、schema、静态工具 Prompt、一次性 Tool Recovery 和执行定义。ToolView 只从冻结 Registry view 与当前 AgentRun 已提交的工具结果投影，不维护独立的失败计数或 permission 事实。ToolExecutor 在严格输入校验和目标解析后调用统一 Target Authorization：Workspace Root 内目标自动允许，越界目标由 SessionEngine 的 PermissionManager 裁决；handler 只能使用已授权 targets。AgentLoop 不依赖具体工具实现，ContextManager 和 ModelAdapter 对同一次 ModelCall 消费同一个 ToolView 快照。
+工具模块提供 ToolView，其中同时绑定可见 ToolSpec、schema、静态工具 Prompt、一次性 Tool Recovery 和执行定义。ToolView 只从冻结 Registry view 与当前 AgentRun 已提交的工具结果投影，不维护独立的失败计数或 permission 事实。ToolExecutor 在严格输入校验和目标解析后调用统一 Target Authorization：普通 Workspace Root 目标、Current Session 状态和精确受控引用按规则自动允许，越界、受保护或本地内容外传目标由 SessionEngine 的 PermissionManager 裁决；handler 只能使用已授权 targets。AgentLoop 不依赖具体工具实现，ContextManager 和 ModelAdapter 对同一次 ModelCall 消费同一个 ToolView 快照。
 
 ### 3.8 Persistence、SessionUpdate 与 Trace
 

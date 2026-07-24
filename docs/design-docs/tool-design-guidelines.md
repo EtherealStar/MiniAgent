@@ -14,6 +14,19 @@
 - AgentLoop、SessionEngine 或 ContextManager 的职责变更；
 - 某个具体工具的实施步骤。
 
+已确定的具体内置工具契约位于 `tools/`：
+
+- [`glob`](tools/glob.md)：workspace 目录树中的路径发现；
+- [`grep`](tools/grep.md)：workspace UTF-8 文本的逐行内容搜索；
+- [`read_file`](tools/read-file.md)：已知 UTF-8 文件与受控引用的分页读取；
+- [`write_file`](tools/write-file.md)：带冲突保护的 UTF-8 整文件写入；
+- [`read_docs`](tools/read-docs.md)：使用 MinerU 生成受控 Markdown；
+- [`todo_write`](tools/todo-write.md)：Current Session 的进程内任务状态；
+- [`calculator`](tools/calculator.md)：受限、确定性的数值表达式求值；
+- [`web_search`](tools/web-search.md)：使用 Tavily 的普通 Web 搜索。
+
+具体工具文档可以收紧超时、结果预算、输入范围和重试策略，但不能放宽本文或 `tool-registry-and-execution.md` 的框架边界。
+
 ## 2. 目录与注册
 
 每个内置工具使用同名目录：
@@ -178,12 +191,17 @@ ToolTarget(
 )
 ```
 
-- resolver 负责从业务 input 声明完整目标、Target Capability（read/write/delete）和 Target Scope（exact/subtree）；路径规范化、Workspace Root 判断与越界 permission 统一交给 Target Authorization；
+- resolver 负责从业务 input 声明完整目标、Target Capability（read/write/delete）和 Target Scope（exact/subtree）；路径规范化、Workspace Root、Protected Workspace Subtree 与 permission 统一交给 Target Authorization；
 - 多资源操作声明全部目标，例如 copy 同时声明 source/read 与 destination/write；
 - move/rename 同时声明 source/delete 与 destination/write；递归访问必须声明 subtree，不能用 exact 授权后再遍历后代；
 - 没有资源目标的纯计算工具显式返回空 targets；
 - handler 通过 `ExecutionContext.targets` 使用已经授权的资源，不从原始路径参数重新建立旁路；
 - handler 不自行实现另一套权限、路径或 guard 规则。
+- Protected Workspace Subtree 由 Target Authorization 统一裁决；递归工具从普通祖先扫描时必须按具体工具契约跳过受保护子树，不能借祖先的 subtree target 绕过显式许可；
+- Current Session 的内部状态使用 `session_state/<capability>/exact`，session identity 由 Executor 绑定，不能成为模型业务参数；
+- 固定外部只读服务使用 `external_service/read/exact` target，并由 composition root 显式配置和启用；向外部服务上传本地内容必须声明 `external_service/write/exact` 并取得 Permission Decision；
+- ArtifactRef 与 DocumentRef 只能由受控 store 生成和登记；精确受控引用可以获得 Protected Workspace Subtree 读取豁免，模型手写的相似路径不能；
+- 模型参数不能提供或扩大固定服务 host、session identity 或受控引用范围。
 
 ## 8. Classification 与并发
 
@@ -218,6 +236,8 @@ async def handler(args: ToolInput, context: ExecutionContext) -> ToolOutput:
 
 工具错误面向模型的 code、stage、message、字段错误和恢复建议使用英文。不要把 Python 异常、堆栈、环境值、secret 或未经处理的敏感路径直接返回给模型。
 
+handler 抛出的 `ToolExecutionError` 必须使用 `tool-registry-and-execution.md` 定义的封闭 `ExecutionErrorCode`，并提供安全英文 `safe_message`。工具不得自创顶层执行错误码；具体原因通过 message 表达。参数验证、Target Authorization、取消、outcome unknown 和内部协议错误继续由 Executor 各自的边界负责，不能伪装成 handler 执行失败。
+
 两种重试不能混淆：
 
 ```text
@@ -238,7 +258,21 @@ async def handler(args: ToolInput, context: ExecutionContext) -> ToolOutput:
 
 ## 11. Result Policy 与持久化
 
-ResultPolicy 约束完整 ToolOutput 的规范 JSON UTF-8 大小，包括 content、metadata 和 data。工具不能通过结构化字段绕过结果预算。
+ResultPolicy 约束完整 ToolOutput 的规范 JSON UTF-8 大小，包括 content、metadata 和 data。工具不能通过结构化字段绕过结果预算。每个内置工具显式声明或继承：
+
+```python
+ResultPolicy(
+    max_inline_bytes=50 * 1024,
+    overflow_behavior="externalize",  # externalize | error
+    max_model_tokens=None,
+)
+```
+
+- 未显式配置时使用 50 KiB 与 `externalize`；具体工具可以声明自己的字节阈值和溢出行为；
+- `externalize` 把完整 ToolOutput 交给 ArtifactStore；`error` 返回 `RESOURCE_EXHAUSTED` 且不得创建 ArtifactRef；
+- `max_model_tokens` 若非空，只计算模型可见 content，并使用 AgentRun 冻结的 tokenizer；
+- 字节或 Token 达到工具上限时按 overflow_behavior 处理，不能由 handler 返回半个成功结果；
+- 选择 `error` 的读取工具必须用输入范围和测试证明所有成功输出均可内联。
 
 - 未超过阈值：完整 output 随 ToolResultPart 写入 Message Journal；
 - 超过阈值：ArtifactStore 写入完整 `result.json`，ToolResultPart 只保存统一 content 预览和 ArtifactRef；
@@ -269,6 +303,11 @@ ResultPolicy 约束完整 ToolOutput 的规范 JSON UTF-8 大小，包括 conten
 16. ContextManager 与 ModelAdapter 在同一 ModelCall 中消费同一个刷新后的 ToolView；
 17. 文件系统测试只使用 pytest temporary directories，不依赖真实网络、凭据或用户 Session 数据。
 18. 越界多目标按单个 ToolUse 整体裁决，handler 只收到全部获准的 targets；permission 等待不消耗工具 timeout，拒绝不触发连续失败移除。
+19. Protected Workspace Subtree、硬排除目录和固定 external_service target 分别遵守其授权语义，祖先 subtree 或业务参数不能形成旁路。
+20. ToolExecutionError 只使用框架级 ExecutionErrorCode，safe_message 不泄露实现异常或 secret，transient 只有在 RetryPolicy 允许时才重放。
+21. `overflow_behavior=error` 在字节或 Token 边界生成 RESOURCE_EXHAUSTED，不保存部分 output 或 ArtifactRef。
+22. Current Session 的 ArtifactRef、DocumentRef 与 session_state exact target 能通过受控目录裁决，伪造引用或跨 Session 访问被拒绝。
+23. external_service/write 本地内容外传在 handler 前取得 Permission Decision，拒绝时不读取业务正文或发送网络请求。
 
 开发时先运行聚焦测试。完成代码变更前按仓库约定运行：
 
@@ -285,8 +324,10 @@ uv run python -m pytest -q
 - input/output schema 是否都从严格 Pydantic model 派生？
 - handler 是否只返回成功 ToolOutput，并通过授权 targets 使用资源？
 - 每个目标是否声明了最小 Target Capability 和准确的 exact/subtree 范围，复合操作是否声明全部目标？
+- 受保护子树、硬排除资源和固定外部服务是否由统一 Target Authorization 表达，而不是藏在 Prompt 或 handler 中？
 - 并发安全是否有明确无副作用依据？
 - transient retry 是否确认可安全重放？
 - content、metadata 和 data 是否都不泄露敏感信息？
 - 大结果是否交给 ResultPolicy 和 ArtifactStore？
+- 禁止外置的工具是否声明 `overflow_behavior=error`、自限流并覆盖边界测试？
 - 测试是否覆盖 schema、Prompt、targets、输出、失败、并发、结果治理和动态 ToolView？
